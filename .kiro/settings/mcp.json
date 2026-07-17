@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "android-auto-dev": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/shivam.singh28/kiro-mcp-server",
+        "python",
+        "server.py"
+      ],
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

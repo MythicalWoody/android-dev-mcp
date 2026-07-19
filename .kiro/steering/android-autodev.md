@@ -1,26 +1,37 @@
 # Autonomous Android Development Protocol
 
 ## Core Directive
-You are an autonomous agent. After the user answers initial clarifying questions, you MUST execute the full SDLC loop without waiting for human approval. Do not stop until ALL validation gates pass.
+You are an autonomous agent. After the user answers initial clarifying questions, propose the high-level coding architecture and **PAUSE for user review/approval**. Do not start implementation until the user confirms the architecture is correct or requests changes. Once the architecture is approved, execute the remaining SDLC loop autonomously.
 
 ## Execution Loop Rules
 
-1. **Code Generation:** Write code strictly following `design.md`.
-2. **Mock Interceptor Generation:** Call `generate_mock_interceptor("<spec_path>", "<package_name>", "<project_path>")` to generate `MockApiInterceptor.kt` in `src/mockDebug/`.
-3. **Compile Gate:** Immediately call `run_gradle("assembleMockDebug", "<project_path>")`.
+1. **Design & Requirements:** Use the provided `requirements.md`, Figma URL, and clarifying answers. Extract design context from Figma when a URL is provided.
+2. **Architecture Proposal:** Propose the coding architecture (screen/activity structure, ViewModels, repositories, DI, network layer, navigation flow). **STOP and wait for explicit user approval or modification instructions.**
+3. **Code Generation:** Only after architecture approval, write code strictly following `design.md` and the approved architecture.
+4. **Compile Gate:** Immediately call `run_gradle("assembleMockDebug", "<project_path>")`.
    - IF FAILURE: Analyze `error_output`, fix code, and RE-RUN. Max 5 retries.
-4. **Unit Test Gate:** Call `run_gradle("testMockDebugUnitTest", "<project_path>")`.
+5. **Unit Test Gate:** Call `run_gradle("testMockDebugUnitTest", "<project_path>")`.
    - IF FAILURE: Fix failing tests/code. RE-RUN. Max 5 retries.
-5. **Pre-E2E Cleanup:** Call `cleanup_test_environment("<project_path>", "<package_name>")` before EVERY E2E attempt.
-6. **E2E Gate:** Generate Appium pytest script validating the exact flow in `requirements.md`. Call `run_appium_e2e("<script_path>", "<project_path>")`.
-   - IF FAILURE: Call `capture_and_verify_ui("<project_path>/test-artifacts", "<failing_requirement>")`. Compare screenshot/XML against `design.md`. Fix UI/logic. RE-RUN. Max 8 retries.
+6. **Mock Interceptor Generation:** Call `generate_mock_interceptor("<spec_path>", "<package_name>", "<project_path>")` to generate `MockApiInterceptor.kt` in `src/mockDebug/`. Ensure every endpoint and every scenario in the flow has a mocked response.
+7. **Pre-E2E Cleanup:** Call `cleanup_test_environment("<project_path>", "<package_name>")` before EVERY E2E attempt.
+8. **Visual Verification Gate:**
+   - Launch the app/activity with `launch_activity(...)`.
+   - Run the generated Appium E2E script with `run_appium_e2e("<script_path>", "<project_path>")`.
+   - Capture the runtime UI with `capture_ui_state("<project_path>/test-artifacts")`.
+   - Check the Figma reference cache with `get_figma_reference_cache("<project_path>", "<file_key>", "<node_id>")`.
+     - **If CACHED:** use the returned `cache_path` as the reference screenshot.
+     - **If NOT_CACHED:** fetch the Figma node screenshot using the Figma MCP server (OAuth flow), then call `cache_figma_reference("<fetched_path>", "<project_path>", "<file_key>", "<node_id>")` to store it for reuse.
+   - Compare the runtime screenshot against the reference using `compare_screenshots("<reference_path>", "<runtime_screenshot>", "<project_path>/test-artifacts")`.
+   - IF confidence score is **greater than 95%**: stop development and mark the task as done.
+   - ELSE: identify the mismatches, fix the UI/logic, and RE-RUN the visual verification gate. Max 8 retries.
 
 ## Definition of Done
 Process terminates ONLY when:
-- Gradle assembleMockDebug exit code = 0
-- Unit tests pass rate = 100%
-- Appium E2E pass rate = 100%
-- Visual verification confirms alignment with spec
+- Coding architecture has been reviewed and approved by the user.
+- Gradle assembleMockDebug exit code = 0.
+- Unit tests pass rate = 100%.
+- All API endpoints and scenarios in the flow are mocked in `MockApiInterceptor.kt`.
+- Runtime UI visually matches the Figma design with a confidence score **> 95%**.
 
 ## Critical Constraints
 - NEVER claim success without executing validation tools.

@@ -5,6 +5,8 @@ import os
 import logging
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+from PIL import Image
+import httpx
 
 mcp = FastMCP("AndroidAutoDev")
 
@@ -12,6 +14,62 @@ mcp = FastMCP("AndroidAutoDev")
 ALLOWED_PROJECT_ROOT = os.environ.get(
     "ANDROID_PROJECT_ROOT", "/Users/shivam.singh28"
 )
+
+# --- Figma Configuration ---
+FIGMA_API_BASE = "https://api.figma.com/v1"
+FIGMA_ACCESS_TOKEN = os.environ.get("FIGMA_ACCESS_TOKEN")
+
+
+def _get_figma_access_token() -> str:
+    """Return the configured Figma access token or raise an error."""
+    token = os.environ.get("FIGMA_ACCESS_TOKEN")
+    if not token:
+        raise ValueError(
+            "FIGMA_ACCESS_TOKEN environment variable is not set. "
+            "Set it to a Figma personal access token."
+        )
+    return token
+
+
+def _parse_figma_url(url_or_key: str) -> tuple[str, str | None]:
+    """Extract file_key and optional node_id from a Figma URL or return the key as-is."""
+    import re
+    url = url_or_key.strip()
+    # Full design URL: https://figma.com/design/{fileKey}/...?node-id=1-2
+    design_match = re.search(r"figma\.com/design/([A-Za-z0-9]+)(?:/[^?]*)?(?:\?.*node-id=([0-9]+[-:][0-9]+))?", url)
+    if design_match:
+        file_key = design_match.group(1)
+        node_id = design_match.group(2)
+        if node_id:
+            node_id = node_id.replace("-", ":")
+        return file_key, node_id
+    # Bare key
+    return url, None
+
+
+def _normalize_figma_node_id(node_id: str) -> str:
+    """Figma REST API uses ':' separators; UI URLs use '-'."""
+    return node_id.strip().replace("-", ":")
+
+
+async def _figma_api_request(path: str, params: dict | None = None) -> dict:
+    """Make an authenticated GET request to the Figma REST API."""
+    headers = {"X-Figma-Token": _get_figma_access_token()}
+    url = f"{FIGMA_API_BASE}{path}"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers, params=params, timeout=30.0)
+        response.raise_for_status()
+        return response.json()
+
+
+async def _download_figma_image(url: str, dest_path: str) -> None:
+    """Download a Figma rendered image to a local file."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, timeout=60.0)
+        response.raise_for_status()
+        with open(dest_path, "wb") as f:
+            f.write(response.content)
+
 
 # --- Structured Logging ---
 LOG_DIR = "/tmp/kiro-android-autodev"
@@ -1905,6 +1963,369 @@ def appium_options(request):
 def appium_host(request):
     return request.config.getoption("--appium-host")
 '''
+
+
+# --- Figma Reference Cache Helpers ---
+def _figma_cache_path(project_path: str, file_key: str, node_id: str, ext: str = "png") -> str:
+    """Return the canonical local cache path for a Figma node screenshot."""
+    safe_node_id = node_id.replace(":", "_").replace("-", "_").replace("/", "_")
+    cache_dir = os.path.join(project_path, "test-artifacts", "figma-cache", file_key)
+    return os.path.join(cache_dir, f"{safe_node_id}.{ext}")
+
+
+# ============================================================
+# TOOL 11: Cache Figma Reference Screenshot
+# ============================================================
+@mcp.tool()
+async def cache_figma_reference(
+    source_screenshot_path: str,
+    project_path: str,
+    file_key: str,
+    node_id: str,
+) -> dict:
+    """Store a Figma reference screenshot in the project cache for reuse.
+
+    Call this after fetching the screenshot via the Figma MCP server so future
+    comparisons can read from disk instead of hitting Figma again.
+    """
+    import shutil
+
+    logger.info(
+        f"cache_figma_reference: src={source_screenshot_path}, "
+        f"project={project_path}, file={file_key}, node={node_id}"
+    )
+
+    try:
+        source_screenshot_path = validate_path(source_screenshot_path, "source_screenshot_path")
+        project_path = validate_path(project_path, "project_path")
+    except ValueError as e:
+        return {"status": "FAILURE", "error_output": str(e)}
+
+    if not os.path.exists(source_screenshot_path):
+        return {
+            "status": "FAILURE",
+            "error_output": f"Source screenshot not found: {source_screenshot_path}",
+        }
+
+    try:
+        cache_path = _figma_cache_path(project_path, file_key, node_id)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        shutil.copy2(source_screenshot_path, cache_path)
+        logger.info(f"cache_figma_reference: cached at {cache_path}")
+        return {
+            "status": "SUCCESS",
+            "cache_path": cache_path,
+            "message": f"Reference cached at {cache_path}",
+        }
+    except Exception as e:
+        logger.error(f"cache_figma_reference ERROR: {e}")
+        return {"status": "FAILURE", "error_output": str(e)}
+
+
+# ============================================================
+# TOOL 12: Check Figma Reference Cache
+# ============================================================
+@mcp.tool()
+async def get_figma_reference_cache(
+    project_path: str,
+    file_key: str,
+    node_id: str,
+) -> dict:
+    """Check if a Figma reference screenshot is already cached locally.
+
+    Returns the cache path and status. If CACHED, you can pass the path directly
+    to compare_screenshots or compare_ui_to_figma without calling Figma MCP.
+    """
+    logger.info(f"get_figma_reference_cache: project={project_path}, file={file_key}, node={node_id}")
+
+    try:
+        project_path = validate_path(project_path, "project_path")
+    except ValueError as e:
+        return {"status": "FAILURE", "error_output": str(e)}
+
+    cache_path = _figma_cache_path(project_path, file_key, node_id)
+    if os.path.exists(cache_path):
+        logger.info(f"get_figma_reference_cache: HIT at {cache_path}")
+        return {
+            "status": "CACHED",
+            "cache_path": cache_path,
+            "message": "Reference screenshot found in cache.",
+        }
+
+    logger.info(f"get_figma_reference_cache: MISS at {cache_path}")
+    return {
+        "status": "NOT_CACHED",
+        "cache_path": cache_path,
+        "message": "Reference screenshot not cached; fetch from Figma MCP and call cache_figma_reference.",
+    }
+
+
+# ============================================================
+# TOOL 12: Fetch Figma Design Context
+# ============================================================
+@mcp.tool()
+async def fetch_figma_design_context(
+    figma_url_or_key: str,
+    node_id: str,
+    output_dir: str,
+) -> dict:
+    """Fetch Figma node metadata and a rendered PNG screenshot for a given frame/screen.
+
+    Use this to pull the reference design that the runtime UI will be compared against.
+    Accepts either a full Figma URL (with node-id) or a bare file key.
+    """
+    logger.info(f"fetch_figma_design_context: url/key={figma_url_or_key}, node={node_id}")
+
+    try:
+        output_dir = validate_path(output_dir, "output_dir")
+    except ValueError as e:
+        return {"status": "FAILURE", "error_output": str(e)}
+
+    try:
+        file_key, parsed_node_id = _parse_figma_url(figma_url_or_key)
+        if parsed_node_id:
+            node_id = parsed_node_id
+        node_id = _normalize_figma_node_id(node_id)
+
+        # Fetch node metadata
+        nodes_response = await _figma_api_request(
+            f"/files/{file_key}/nodes",
+            params={"ids": node_id},
+        )
+        node_data = nodes_response.get("nodes", {}).get(node_id, {})
+
+        # Fetch rendered image URL
+        image_response = await _figma_api_request(
+            f"/images/{file_key}",
+            params={"ids": node_id, "format": "png", "scale": "2"},
+        )
+        image_url = image_response.get("images", {}).get(node_id)
+        if not image_url:
+            return {
+                "status": "FAILURE",
+                "error_output": "Figma did not return an image URL for this node. Ensure the node is exportable.",
+            }
+
+        # Download the reference screenshot
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = os.path.join(output_dir, f"figma_{timestamp}.png")
+        await _download_figma_image(image_url, screenshot_path)
+
+        logger.info("fetch_figma_design_context: SUCCESS")
+        return {
+            "status": "SUCCESS",
+            "file_key": file_key,
+            "node_id": node_id,
+            "screenshot_path": screenshot_path,
+            "image_url": image_url,
+            "node_name": node_data.get("document", {}).get("name", "Unknown"),
+            "node_type": node_data.get("document", {}).get("type", "Unknown"),
+            "node_metadata": node_data,
+            "message": f"Downloaded Figma reference for node '{node_id}' to {screenshot_path}.",
+        }
+    except Exception as e:
+        logger.error(f"fetch_figma_design_context ERROR: {e}")
+        return {"status": "FAILURE", "error_output": str(e)}
+
+
+# ============================================================
+# TOOL 13: Compare Runtime UI to Figma Design
+# ============================================================
+def _compute_image_similarity(
+    ref_path: str, cmp_path: str, diff_path: str | None = None
+) -> dict:
+    """Compute a pixel-level similarity score between two images.
+
+    Returns a similarity_score from 0 to 100, where 100 means identical.
+    This is a strict pixel comparison; even small offsets or anti-aliasing
+    differences will lower the score.
+    """
+    ref = Image.open(ref_path).convert("RGB")
+    cmp_img = Image.open(cmp_path).convert("RGB")
+
+    # Resize the comparison image to match the reference dimensions
+    cmp_resized = cmp_img.resize(ref.size, Image.Resampling.LANCZOS)
+
+    ref_pixels = list(ref.getdata())
+    cmp_pixels = list(cmp_resized.getdata())
+
+    total_diff = 0.0
+    diff_pixels = []
+    for (r1, g1, b1), (r2, g2, b2) in zip(ref_pixels, cmp_pixels):
+        pdiff = (abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)) / 3.0
+        total_diff += pdiff
+        diff_pixels.append((int(pdiff), int(pdiff), int(pdiff)))
+
+    num_pixels = len(ref_pixels)
+    avg_diff = total_diff / num_pixels if num_pixels else 0.0
+    similarity = max(0.0, 100.0 - (avg_diff / 255.0) * 100.0)
+
+    if diff_path:
+        diff = Image.new("RGB", ref.size)
+        diff.putdata(diff_pixels)
+        diff.save(diff_path)
+
+    return {
+        "similarity_score": round(similarity, 2),
+        "average_pixel_difference": round(avg_diff, 2),
+        "reference_size": ref.size,
+        "comparison_size": cmp_img.size,
+    }
+
+
+@mcp.tool()
+async def compare_ui_to_figma(
+    runtime_screenshot_path: str,
+    output_dir: str,
+    figma_url_or_key: str = "",
+    node_id: str = "",
+    figma_screenshot_path: str = "",
+) -> dict:
+    """Compare a runtime Android screenshot against a Figma design frame.
+
+    Works in two modes:
+    1. Token-based: provide figma_url_or_key + node_id and set FIGMA_ACCESS_TOKEN.
+       The server downloads the reference image from the Figma REST API.
+    2. OAuth/MCP-based: provide figma_screenshot_path pointing to a local reference
+       image already fetched by the Figma MCP server. No token needed.
+
+    Returns a confidence score; > 95 means the UI matches the reference design.
+    """
+    logger.info(
+        f"compare_ui_to_figma: runtime={runtime_screenshot_path}, "
+        f"local_ref={figma_screenshot_path}, url={figma_url_or_key}, node={node_id}"
+    )
+
+    try:
+        runtime_screenshot_path = validate_path(runtime_screenshot_path, "runtime_screenshot_path")
+        output_dir = validate_path(output_dir, "output_dir")
+    except ValueError as e:
+        return {"status": "FAILURE", "error_output": str(e)}
+
+    if not os.path.exists(runtime_screenshot_path):
+        return {
+            "status": "FAILURE",
+            "error_output": f"Runtime screenshot not found: {runtime_screenshot_path}",
+        }
+
+    try:
+        # Resolve the Figma reference image
+        if figma_screenshot_path:
+            ref_path = validate_path(figma_screenshot_path, "figma_screenshot_path")
+            if not os.path.exists(ref_path):
+                return {
+                    "status": "FAILURE",
+                    "error_output": f"Figma screenshot not found: {ref_path}",
+                }
+            node_name = "local_reference"
+        elif figma_url_or_key and node_id:
+            fetch_result = await fetch_figma_design_context(figma_url_or_key, node_id, output_dir)
+            if fetch_result["status"] != "SUCCESS":
+                return fetch_result
+            ref_path = fetch_result["screenshot_path"]
+            node_name = fetch_result.get("node_name", "figma_reference")
+        else:
+            return {
+                "status": "FAILURE",
+                "error_output": (
+                    "Provide either figma_screenshot_path (OAuth/MCP flow) "
+                    "or both figma_url_or_key and node_id (token flow)."
+                ),
+            }
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        diff_path = os.path.join(output_dir, f"ui_diff_{timestamp}.png")
+
+        similarity = _compute_image_similarity(ref_path, runtime_screenshot_path, diff_path)
+        confidence = similarity["similarity_score"]
+        passed = confidence > 95.0
+
+        logger.info(f"compare_ui_to_figma: confidence={confidence}, passed={passed}")
+        return {
+            "status": "SUCCESS",
+            "confidence_score": confidence,
+            "passed_threshold": passed,
+            "threshold": 95.0,
+            "runtime_screenshot_path": runtime_screenshot_path,
+            "figma_screenshot_path": ref_path,
+            "diff_image_path": diff_path,
+            "figma_node_name": node_name,
+            "similarity_details": similarity,
+            "message": (
+                f"Confidence score: {confidence}%. "
+                f"{'Design matches Figma within threshold.' if passed else 'UI deviates from Figma; fixes required.'}"
+            ),
+        }
+    except Exception as e:
+        logger.error(f"compare_ui_to_figma ERROR: {e}")
+        return {"status": "FAILURE", "error_output": str(e)}
+
+
+# ============================================================
+# TOOL 14: Compare Two Local Screenshots
+# ============================================================
+@mcp.tool()
+async def compare_screenshots(
+    reference_screenshot_path: str,
+    runtime_screenshot_path: str,
+    output_dir: str,
+) -> dict:
+    """Compare a reference screenshot against a runtime screenshot and return a confidence score.
+
+    Use this when the reference image has already been obtained externally
+    (e.g., via the Figma MCP server under OAuth) and saved to disk.
+    """
+    logger.info(
+        f"compare_screenshots: ref={reference_screenshot_path}, "
+        f"runtime={runtime_screenshot_path}"
+    )
+
+    try:
+        reference_screenshot_path = validate_path(reference_screenshot_path, "reference_screenshot_path")
+        runtime_screenshot_path = validate_path(runtime_screenshot_path, "runtime_screenshot_path")
+        output_dir = validate_path(output_dir, "output_dir")
+    except ValueError as e:
+        return {"status": "FAILURE", "error_output": str(e)}
+
+    if not os.path.exists(reference_screenshot_path):
+        return {
+            "status": "FAILURE",
+            "error_output": f"Reference screenshot not found: {reference_screenshot_path}",
+        }
+    if not os.path.exists(runtime_screenshot_path):
+        return {
+            "status": "FAILURE",
+            "error_output": f"Runtime screenshot not found: {runtime_screenshot_path}",
+        }
+
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        diff_path = os.path.join(output_dir, f"screenshot_diff_{timestamp}.png")
+
+        similarity = _compute_image_similarity(
+            reference_screenshot_path, runtime_screenshot_path, diff_path
+        )
+        confidence = similarity["similarity_score"]
+        passed = confidence > 95.0
+
+        logger.info(f"compare_screenshots: confidence={confidence}, passed={passed}")
+        return {
+            "status": "SUCCESS",
+            "confidence_score": confidence,
+            "passed_threshold": passed,
+            "threshold": 95.0,
+            "reference_screenshot_path": reference_screenshot_path,
+            "runtime_screenshot_path": runtime_screenshot_path,
+            "diff_image_path": diff_path,
+            "similarity_details": similarity,
+            "message": (
+                f"Confidence score: {confidence}%. "
+                f"{'Screenshots match within threshold.' if passed else 'Screenshots differ; fixes required.'}"
+            ),
+        }
+    except Exception as e:
+        logger.error(f"compare_screenshots ERROR: {e}")
+        return {"status": "FAILURE", "error_output": str(e)}
 
 
 if __name__ == "__main__":

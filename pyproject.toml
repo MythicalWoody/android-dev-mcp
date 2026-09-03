@@ -4,4 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["mcp[cli]", "Pillow", "httpx"]
+dependencies = [
+    "Appium-Python-Client>=2,<6",
+    "httpx",
+    "mcp[cli]",
+    "Pillow",
+    "pytest>=7,<10",
+    "pytest-json-report>=1.5,<2",
+]

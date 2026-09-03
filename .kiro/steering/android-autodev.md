@@ -29,6 +29,7 @@ Before every API-dependent implementation or test workflow, explicitly ask:
 6. **Conditional Mock Generation:** Only in confirmed mock mode, call `activate_mock_environment(...)` with the selection token and then `generate_mock_interceptor(...)`. Skip this step entirely in real mode.
 7. **Pre-E2E Cleanup:** Call `cleanup_test_environment("<project_path>", "<package_name>")` before EVERY E2E attempt.
 8. **Visual Verification Gate:**
+   - Call `verify_emulator_ready()` and use its returned `device_serial` for launch, E2E, screenshots, and cleanup. Never assume `emulator-5554`. If multiple devices are online, require an explicit serial.
    - Launch the app/activity with `launch_activity(...)`.
    - Run the generated Appium E2E script with `run_appium_e2e("<script_path>", "<project_path>")`.
    - Capture the runtime UI with `capture_ui_state("<project_path>/test-artifacts")`.
@@ -38,6 +39,17 @@ Before every API-dependent implementation or test workflow, explicitly ask:
    - Compare the runtime screenshot against the reference using `compare_screenshots("<reference_path>", "<runtime_screenshot>", "<project_path>/test-artifacts")`.
    - IF confidence score is **greater than 95%**: stop development and mark the task as done.
    - ELSE: identify the mismatches, fix the UI/logic, and RE-RUN the visual verification gate. Max 8 retries.
+9. **Final Cleanup Gate:** Call `cleanup_test_environment(..., final_cleanup=true)`, then `verify_no_temporary_mock_wiring(project_path)`. Delivery is blocked unless the audit returns `CLEAN`.
+
+## Environment and Tooling Reliability
+
+- Generated Appium tests must import `UiAutomator2Options` from `appium.options.android`, with the legacy `appium.options` location only as an import fallback.
+- All ADB commands and Appium capabilities must use the serial resolved from `adb devices` or an explicit `device_serial` argument.
+- Never silently select a device when more than one is online.
+- Gradle and pytest subprocesses must run in an MCP-owned process group and be terminated as a group on timeout or cancellation.
+- Keep individual tool execution below the 300-second MCP wrapper limit. Gradle defaults to 240 seconds (maximum 270); Appium tests default to 180 seconds (maximum 210) so device/server readiness also fits inside the wrapper.
+- Generate OkHttp accessors according to the project version: Java-style methods for OkHttp 3.x and Kotlin properties for OkHttp 4+.
+- A real-API E2E run must fail closed if any MCP-tagged mock wiring is detected.
 
 ## Definition of Done
 Process terminates ONLY when:
@@ -47,6 +59,7 @@ Process terminates ONLY when:
 - Unit tests pass rate = 100%.
 - In mock mode only, all API endpoints and scenarios are mocked in `MockApiInterceptor.kt`.
 - In real mode, no temporary mock integration exists.
+- `verify_no_temporary_mock_wiring` returns `CLEAN` after final cleanup.
 - Runtime UI visually matches the Figma design with a confidence score **> 95%**.
 
 ## Critical Constraints
@@ -56,6 +69,8 @@ Process terminates ONLY when:
 - NEVER ask user for next steps during execution loop.
 - NEVER use external mock servers (WireMock, MockWebServer). Use ONLY the generated OkHttp interceptor.
 - NEVER create files outside `src/mockDebug/` for mocking purposes.
+- NEVER hardcode an emulator/device serial in generated tests.
+- NEVER report a timeout while leaving the underlying Gradle or pytest process running.
 - If max retries exceeded, halt and provide detailed diagnostic report.
 - All structured logs are written to `/tmp/kiro-android-autodev/agent.log`.
 

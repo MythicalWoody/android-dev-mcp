@@ -7,8 +7,9 @@ This guide explains how to connect your Android project to the Kiro MCP server s
 ## Prerequisites
 
 - Kiro IDE with MCP server connected (`android-auto-dev`)
-- Android emulator (AVD) available via `adb`
+- An authorized physical, network, or emulated Android device visible in `adb devices`
 - Appium installed globally (`npm install -g appium`)
+- Appium UiAutomator2 driver installed (`appium driver install uiautomator2`)
 - Python 3.10+ with `uv` for the MCP server
 - Node.js for Appium
 
@@ -197,14 +198,14 @@ Package: com.example.myapp
 ### What the Agent Does Automatically
 
 1. Reads `requirements.md` and `design.md`
-2. Generates feature code (Activities, ViewModels, etc.)
-3. Calls `generate_mock_interceptor` → creates `MockApiInterceptor.kt` in `src/mockDebug/`
-4. Calls `run_gradle("assembleMockDebug", ...)` → compile gate
-5. Calls `run_gradle("testMockDebugUnitTest", ...)` → unit test gate
-6. Calls `cleanup_test_environment(...)` → clean slate
-7. Generates Appium E2E test script
-8. Calls `run_appium_e2e(...)` → E2E gate
-9. On failure: calls `capture_and_verify_ui(...)` → visual check, fixes, retries
+2. Asks whether to use the deployed real API or temporary mock responses
+3. Generates feature code after architecture approval
+4. Generates and activates mock wiring only when mock mode was explicitly selected
+5. Builds and tests the variant matching the selected API mode
+6. Resolves the actual connected ADB device (physical, network, or emulator)
+7. Generates and runs the Appium E2E test against that resolved serial
+8. On failure: captures UI state, fixes the issue, and retries
+9. Performs final cleanup and verifies that no temporary mock wiring remains
 
 ### The agent halts when:
 - All gates pass (success), OR
@@ -216,14 +217,15 @@ Package: com.example.myapp
 
 | Tool | Purpose |
 |------|---------|
-| `run_gradle(command, project_path)` | Run whitelisted Gradle commands |
+| `run_gradle(command, project_path, timeout_seconds?)` | Run whitelisted Gradle commands; timed-out process trees are terminated |
 | `generate_mock_interceptor(spec_path, package_name, output_dir)` | Generate OkHttp interceptor from spec |
 | `run_appium_test(test_script_path)` | Simple Appium test execution |
-| `run_appium_e2e(test_script_path, project_path)` | Full E2E orchestration with retries |
-| `capture_ui_state(output_dir)` | Screenshot + XML dump |
+| `run_appium_e2e(test_script_path, project_path, device_serial?)` | Full E2E orchestration on a resolved ADB device |
+| `capture_ui_state(output_dir, device_serial?)` | Screenshot + XML dump from the selected device |
 | `capture_and_verify_ui(output_dir, spec_requirement)` | Capture + verification context |
-| `verify_emulator_ready()` | Pre-flight emulator check |
-| `cleanup_test_environment(project_path, package_name)` | Full teardown between runs |
+| `verify_emulator_ready(device_serial?)` | Resolve and verify a physical or emulated Android device |
+| `cleanup_test_environment(project_path, package_name, device_serial?, final_cleanup?)` | Teardown between runs and optional final mock cleanup |
+| `verify_no_temporary_mock_wiring(project_path)` | Final audit for MCP-generated mock wiring |
 
 ---
 
@@ -234,7 +236,7 @@ Package: com.example.myapp
 | "Gradle command not whitelisted" | Only commands in the allow-list work. Check steering rules for the full list. |
 | "Path outside allowed root" | Set `ANDROID_PROJECT_ROOT` env var to cover your project path |
 | "No module named 'mcp'" | Run `uv sync` in the MCP server directory |
-| Emulator timeout | Start your AVD manually before triggering E2E |
+| Device timeout | Check `adb devices`; pass `device_serial` when multiple devices are online |
 | Appium not found | Install globally: `npm install -g appium` |
 | E2E flaky failures | Agent calls `cleanup_test_environment` between retries automatically |
 
@@ -252,7 +254,7 @@ Add to your `.gitignore`:
 test-artifacts/
 ```
 
-The `mockDebug` source set files ARE meant to be committed — they're part of your test infrastructure.
+AndroidAutoDev-generated `mockDebug` files are temporary. Do not commit them. Final cleanup removes only MCP-tagged mock files and preserves user-owned test infrastructure.
 
 ---
 

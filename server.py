@@ -1,14 +1,26 @@
 import asyncio
 import json
 import base64
+import hashlib
 import os
 import logging
+import secrets
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from PIL import Image
 import httpx
 
-mcp = FastMCP("AndroidAutoDev")
+MCP_INSTRUCTIONS = """
+Before any API-dependent implementation or test workflow, ask the user whether
+to use the deployed real API or temporary mock responses. Never infer the mode
+from the task, previous workflows, or API availability. After the user answers,
+call select_api_mode with user_confirmed=true. Use the real API without adding
+mock code when mode is real. Call activate_mock_environment only when mode is
+mock, and pass the one-time selection token returned by select_api_mode. Always
+deactivate temporary mocks during final cleanup.
+""".strip()
+
+mcp = FastMCP("AndroidAutoDev", instructions=MCP_INSTRUCTIONS)
 
 # --- Configuration ---
 ALLOWED_PROJECT_ROOT = os.environ.get(
@@ -128,7 +140,7 @@ BLOCKED_GRADLE_COMMANDS = {
 
 def _is_gradle_command_allowed(command: str) -> bool:
     """Check if a Gradle command is allowed via exact match or pattern match."""
-    base_command = command.split()[0] if command else ""
+    base_command = command.strip() if command else ""
 
     # Block dangerous commands first
     if base_command in BLOCKED_GRADLE_COMMANDS:
@@ -179,11 +191,109 @@ def validate_path(path: str, label: str = "path") -> str:
     resolved = os.path.realpath(path)
     if ".." in path:
         raise ValueError(f"Rejected {label}: path traversal ('..') not allowed.")
-    if not resolved.startswith(os.path.realpath(ALLOWED_PROJECT_ROOT)):
+    allowed_root = os.path.realpath(ALLOWED_PROJECT_ROOT)
+    try:
+        is_within_root = os.path.commonpath([resolved, allowed_root]) == allowed_root
+    except ValueError:
+        is_within_root = False
+    if not is_within_root:
         raise ValueError(
             f"Rejected {label}: '{resolved}' is outside allowed root '{ALLOWED_PROJECT_ROOT}'."
         )
     return resolved
+
+
+# --- Temporary mock integration lifecycle ---
+MOCK_GRADLE_BEGIN = "// ANDROID_AUTODEV_MOCK_BEGIN"
+MOCK_GRADLE_END = "// ANDROID_AUTODEV_MOCK_END"
+MOCK_NETWORK_BEGIN = "// ANDROID_AUTODEV_NETWORK_BEGIN"
+MOCK_NETWORK_END = "// ANDROID_AUTODEV_NETWORK_END"
+
+
+def _mock_session_dir(project_path: str) -> str:
+    project_key = hashlib.sha256(project_path.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(LOG_DIR, "sessions", project_key)
+
+
+def _api_mode_selection_path(project_path: str) -> str:
+    project_key = hashlib.sha256(project_path.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(LOG_DIR, "api-mode", f"{project_key}.json")
+
+
+def _load_api_mode_selection(project_path: str) -> dict | None:
+    selection_path = _api_mode_selection_path(project_path)
+    if not os.path.isfile(selection_path):
+        return None
+    with open(selection_path, "r") as handle:
+        return json.load(handle)
+
+
+def _consume_mock_mode_selection(project_path: str, selection_token: str) -> dict:
+    selection = _load_api_mode_selection(project_path)
+    if not selection:
+        raise ValueError(
+            "API mode has not been confirmed. Ask the user to choose 'mock' or "
+            "'real', then call select_api_mode."
+        )
+    if selection.get("mode") != "mock":
+        raise ValueError(
+            "The user selected the real API. Mock activation is not permitted."
+        )
+    if not secrets.compare_digest(selection.get("token", ""), selection_token or ""):
+        raise ValueError(
+            "Invalid or missing API-mode token. Ask the user again and call "
+            "select_api_mode before activating mocks."
+        )
+    return selection
+
+
+def _remove_marked_block(content: str, begin: str, end: str) -> tuple[str, bool]:
+    """Remove one marker-delimited block without disturbing surrounding edits."""
+    start = content.find(begin)
+    if start < 0:
+        return content, False
+    line_start = content.rfind("\n", 0, start) + 1
+    if content[line_start:start].strip() == "":
+        start = line_start
+    finish = content.find(end, start)
+    if finish < 0:
+        raise ValueError(f"Found '{begin}' without matching '{end}'.")
+    finish += len(end)
+    if finish < len(content) and content[finish] == "\n":
+        finish += 1
+    return content[:start] + content[finish:], True
+
+
+def _write_text_atomic(path: str, content: str) -> None:
+    temp_path = f"{path}.android-autodev.tmp"
+    with open(temp_path, "w") as handle:
+        handle.write(content)
+    os.replace(temp_path, path)
+
+
+def _mock_manifest_path(project_path: str) -> str:
+    return os.path.join(_mock_session_dir(project_path), "manifest.json")
+
+
+def _load_mock_manifest(project_path: str) -> dict | None:
+    manifest_path = _mock_manifest_path(project_path)
+    if not os.path.exists(manifest_path):
+        return None
+    with open(manifest_path, "r") as handle:
+        return json.load(handle)
+
+
+def _remove_empty_parents(path: str, stop_at: str) -> None:
+    current = os.path.dirname(path)
+    stop_at = os.path.realpath(stop_at)
+    while os.path.commonpath([os.path.realpath(current), stop_at]) == stop_at:
+        if os.path.realpath(current) == stop_at or not os.path.isdir(current):
+            break
+        try:
+            os.rmdir(current)
+        except OSError:
+            break
+        current = os.path.dirname(current)
 
 
 # --- Internal helpers ---
@@ -233,7 +343,9 @@ async def run_gradle(command: str, project_path: str) -> dict:
     logger.info(f"run_gradle: command={command}, path={project_path}")
 
     # Validate command against whitelist + patterns
-    base_command = command.split()[0] if command else ""
+    # The tool accepts one Gradle task, not arbitrary command-line text. Checking
+    # the complete value and using create_subprocess_exec prevents shell chaining.
+    base_command = command.strip() if command else ""
     if not _is_gradle_command_allowed(command):
         return {
             "status": "FAILURE",
@@ -252,8 +364,9 @@ async def run_gradle(command: str, project_path: str) -> dict:
         return {"status": "FAILURE", "error_output": str(e)}
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            f"./gradlew {command}",
+        proc = await asyncio.create_subprocess_exec(
+            "./gradlew",
+            base_command,
             cwd=project_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -676,7 +789,301 @@ def _generate_fallback_response(method: str, path: str) -> str:
 
 
 # ============================================================
-# TOOL 2: Generate Mock Interceptor (Git-Safe Mocking)
+# TOOL 2: Select API Mode (Mandatory User Choice)
+# ============================================================
+@mcp.tool()
+async def select_api_mode(
+    project_path: str,
+    api_mode: str,
+    user_confirmed: bool = False,
+) -> dict:
+    """Record the user's explicit choice of real API or mock responses.
+
+    The agent MUST ask the user before calling this tool. Set user_confirmed=true
+    only after the user explicitly answers "real" or "mock" for the current
+    workflow. A mock choice returns a one-time token required by
+    activate_mock_environment. A real choice never adds mock code and removes any
+    active temporary mock integration first.
+    """
+    try:
+        project_path = validate_path(project_path, "project_path")
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    mode = (api_mode or "").strip().lower()
+    if not user_confirmed:
+        return {
+            "status": "NEEDS_USER_CHOICE",
+            "question": "Do you want to use the deployed real API or temporary mock responses?",
+            "allowed_modes": ["real", "mock"],
+            "message": "Ask the user and call select_api_mode again with user_confirmed=true.",
+        }
+    if mode not in {"real", "mock"}:
+        return {
+            "status": "FAILURE",
+            "error_output": "api_mode must be exactly 'real' or 'mock'.",
+        }
+
+    cleanup = None
+    if mode == "real" and _load_mock_manifest(project_path):
+        cleanup = await deactivate_mock_environment(project_path)
+        if cleanup["status"] == "FAILURE":
+            return cleanup
+
+    selection_path = _api_mode_selection_path(project_path)
+    os.makedirs(os.path.dirname(selection_path), exist_ok=True)
+    token = secrets.token_urlsafe(24)
+    selection = {
+        "project_path": project_path,
+        "mode": mode,
+        "token": token,
+        "user_confirmed": True,
+        "selected_at": datetime.now().isoformat(),
+    }
+    with open(selection_path, "w") as handle:
+        json.dump(selection, handle, indent=2)
+
+    logger.info(f"select_api_mode: user confirmed mode={mode} project={project_path}")
+    response = {
+        "status": "SUCCESS",
+        "api_mode": mode,
+        "message": (
+            "Real API selected. Do not activate or generate mocks."
+            if mode == "real"
+            else "Mock responses selected. Pass selection_token to activate_mock_environment."
+        ),
+    }
+    if mode == "mock":
+        response["selection_token"] = token
+    if cleanup:
+        response["mock_cleanup"] = cleanup
+    return response
+
+
+# ============================================================
+# TOOL 3: Activate Temporary Mock Integration
+# ============================================================
+@mcp.tool()
+async def activate_mock_environment(
+    project_path: str,
+    package_name: str,
+    selection_token: str,
+    network_module_path: str = "app/src/main/java/com/delhivery/axle/injection/module/NetworkModule.kt",
+) -> dict:
+    """Temporarily add a mock flavor and OkHttp wiring for an MCP work session.
+
+    Requires the one-time token returned after the user explicitly chooses mock
+    mode with select_api_mode. Every source edit is enclosed in unique marker comments. Call
+    deactivate_mock_environment when the work is complete; it removes only those
+    blocks and restores any pre-existing mockDebug source set.
+    """
+    import shutil
+
+    try:
+        project_path = validate_path(project_path, "project_path")
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    try:
+        _consume_mock_mode_selection(project_path, selection_token)
+    except ValueError as exc:
+        return {
+            "status": "NEEDS_USER_CHOICE",
+            "error_output": str(exc),
+            "question": "Do you want to use the deployed real API or temporary mock responses?",
+        }
+
+    gradle_path = os.path.join(project_path, "app", "build.gradle")
+    network_path = os.path.join(project_path, network_module_path)
+    mock_debug_dir = os.path.join(project_path, "app", "src", "mockDebug")
+    manifest_path = _mock_manifest_path(project_path)
+    session_dir = _mock_session_dir(project_path)
+    backup_dir = os.path.join(session_dir, "mockDebug.backup")
+
+    if os.path.exists(manifest_path):
+        return {
+            "status": "ALREADY_ACTIVE",
+            "manifest_path": manifest_path,
+            "message": "Temporary mock integration is already active.",
+        }
+    if not os.path.isfile(gradle_path) or not os.path.isfile(network_path):
+        return {
+            "status": "FAILURE",
+            "error_output": f"Required file missing: {gradle_path if not os.path.isfile(gradle_path) else network_path}",
+        }
+
+    with open(gradle_path, "r") as handle:
+        gradle_content = handle.read()
+    with open(network_path, "r") as handle:
+        network_content = handle.read()
+
+    if MOCK_GRADLE_BEGIN in gradle_content or MOCK_NETWORK_BEGIN in network_content:
+        return {
+            "status": "FAILURE",
+            "error_output": "Temporary mock markers already exist without an active manifest. Run deactivate_mock_environment first.",
+        }
+
+    flavors_anchor = "  productFlavors {\n"
+    timeout_anchor = "      .writeTimeout(15, SECONDS)\n"
+    services_anchor = "  /*/* Services to be placed here */*/\n"
+    missing = [
+        name
+        for name, anchor, content in (
+            ("productFlavors", flavors_anchor, gradle_content),
+            ("OkHttp timeout chain", timeout_anchor, network_content),
+            ("NetworkModule services marker", services_anchor, network_content),
+        )
+        if anchor not in content
+    ]
+    if missing:
+        return {
+            "status": "FAILURE",
+            "error_output": "Could not safely locate: " + ", ".join(missing),
+        }
+
+    gradle_block = (
+        f"    {MOCK_GRADLE_BEGIN}\n"
+        "    mock {\n"
+        "      dimension \"vanilla\"\n"
+        "      resValue \"string\", \"app_name\", \"Mock Axle\"\n"
+        "      resValue(\"bool\", \"FIREBASE_ACTIVATED\", \"false\")\n"
+        "      resValue(\"bool\", \"FIREBASE_PERFORMANCE_LOG\", \"false\")\n"
+        "      resConfigs \"en\", \"xxhdpi\"\n"
+        "    }\n"
+        f"    {MOCK_GRADLE_END}\n"
+    )
+    gradle_content = gradle_content.replace(
+        flavors_anchor, flavors_anchor + gradle_block, 1
+    )
+
+    interceptor_chain_block = (
+        f"      {MOCK_NETWORK_BEGIN}\n"
+        "      .addInterceptor(androidAutoDevMockInterceptor())\n"
+        f"      {MOCK_NETWORK_END}\n"
+    )
+    network_content = network_content.replace(
+        timeout_anchor, timeout_anchor + interceptor_chain_block, 1
+    )
+    helper_block = f'''  {MOCK_NETWORK_BEGIN}
+  private fun androidAutoDevMockInterceptor(): okhttp3.Interceptor {{
+    if (com.delhivery.axle.BuildConfig.FLAVOR != "mock") {{
+      return okhttp3.Interceptor {{ chain -> chain.proceed(chain.request()) }}
+    }}
+
+    return Class.forName("{package_name}.network.MockApiInterceptor")
+        .getDeclaredConstructor()
+        .newInstance() as okhttp3.Interceptor
+  }}
+  {MOCK_NETWORK_END}
+'''
+    network_content = network_content.replace(
+        services_anchor, helper_block + services_anchor, 1
+    )
+
+    os.makedirs(session_dir, exist_ok=True)
+    had_mock_debug = os.path.isdir(mock_debug_dir)
+    if had_mock_debug:
+        shutil.copytree(mock_debug_dir, backup_dir)
+
+    manifest = {
+        "project_path": project_path,
+        "package_name": package_name,
+        "gradle_path": gradle_path,
+        "network_path": network_path,
+        "mock_debug_dir": mock_debug_dir,
+        "mock_debug_backup": backup_dir if had_mock_debug else None,
+        "activated_at": datetime.now().isoformat(),
+    }
+    with open(manifest_path, "w") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    try:
+        _write_text_atomic(gradle_path, gradle_content)
+        _write_text_atomic(network_path, network_content)
+    except Exception as exc:
+        await deactivate_mock_environment(project_path)
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    selection_path = _api_mode_selection_path(project_path)
+    if os.path.isfile(selection_path):
+        os.remove(selection_path)
+
+    logger.info(f"activate_mock_environment: active for {project_path}")
+    return {
+        "status": "SUCCESS",
+        "manifest_path": manifest_path,
+        "temporary_files": [gradle_path, network_path, mock_debug_dir],
+        "message": "Temporary mock integration activated. Always call deactivate_mock_environment in a finally/cleanup step.",
+    }
+
+
+# ============================================================
+# TOOL 3: Deactivate Temporary Mock Integration
+# ============================================================
+@mcp.tool()
+async def deactivate_mock_environment(project_path: str) -> dict:
+    """Remove temporary mock wiring and generated sources, preserving feature edits."""
+    import shutil
+
+    try:
+        project_path = validate_path(project_path, "project_path")
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    manifest = _load_mock_manifest(project_path)
+    if not manifest:
+        return {
+            "status": "NOT_ACTIVE",
+            "message": "No temporary mock integration is active; nothing was changed.",
+        }
+
+    cleaned = []
+    try:
+        for path, begin, end in (
+            (manifest["gradle_path"], MOCK_GRADLE_BEGIN, MOCK_GRADLE_END),
+            (manifest["network_path"], MOCK_NETWORK_BEGIN, MOCK_NETWORK_END),
+        ):
+            with open(path, "r") as handle:
+                content = handle.read()
+            removed_any = False
+            while begin in content:
+                content, removed = _remove_marked_block(content, begin, end)
+                removed_any = removed_any or removed
+            if removed_any:
+                _write_text_atomic(path, content)
+                cleaned.append(path)
+
+        mock_debug_dir = manifest["mock_debug_dir"]
+        if os.path.isdir(mock_debug_dir):
+            shutil.rmtree(mock_debug_dir)
+            cleaned.append(mock_debug_dir)
+        backup_dir = manifest.get("mock_debug_backup")
+        if backup_dir and os.path.isdir(backup_dir):
+            shutil.copytree(backup_dir, mock_debug_dir)
+            cleaned.append(f"restored {mock_debug_dir}")
+        else:
+            _remove_empty_parents(mock_debug_dir, os.path.join(project_path, "app", "src"))
+
+        session_dir = _mock_session_dir(project_path)
+        shutil.rmtree(session_dir)
+        logger.info(f"deactivate_mock_environment: cleaned {project_path}")
+        return {
+            "status": "SUCCESS",
+            "cleaned": cleaned,
+            "message": "Temporary mock integration removed; feature code was preserved.",
+        }
+    except Exception as exc:
+        logger.error(f"deactivate_mock_environment ERROR: {exc}")
+        return {
+            "status": "FAILURE",
+            "error_output": str(exc),
+            "manifest_path": _mock_manifest_path(project_path),
+            "message": "Cleanup is incomplete; the manifest was retained for retry.",
+        }
+
+
+# ============================================================
+# TOOL 4: Generate Mock Interceptor (Temporary Mocking)
 # ============================================================
 @mcp.tool()
 async def generate_mock_interceptor(
@@ -685,7 +1092,8 @@ async def generate_mock_interceptor(
     """Parses design.md/requirements.md and generates a Kotlin OkHttp MockApiInterceptor.
     Outputs to <project_path>/app/src/mockDebug/java/<package>/network/.
     project_path should be the Android project root (e.g., /path/to/MyApp).
-    This is Git-safe: no external WireMock server needed."""
+    activate_mock_environment must be called first. Generated files are removed
+    by deactivate_mock_environment at the end of the MCP work session."""
     import re
 
     logger.info(f"generate_mock_interceptor: spec={spec_path}, pkg={package_name}, project={project_path}")
@@ -695,6 +1103,12 @@ async def generate_mock_interceptor(
         project_path = validate_path(project_path, "project_path")
     except ValueError as e:
         return {"status": "FAILURE", "error_output": str(e)}
+
+    if not _load_mock_manifest(project_path):
+        return {
+            "status": "FAILURE",
+            "error_output": "Mock environment is not active. Call activate_mock_environment first.",
+        }
 
     # Step 1: Read spec file
     try:
@@ -813,10 +1227,10 @@ async def generate_mock_interceptor(
     kotlin_code = f'''package {package_name}.network
 
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType
 import okhttp3.Protocol
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.ResponseBody
 
 /**
  * Auto-generated OkHttp interceptor for mock API responses.
@@ -857,8 +1271,8 @@ class MockApiInterceptor : Interceptor {{
                 Thread.sleep(matchedRoute.delayMs)
             }}
 
-            val mediaType = "application/json".toMediaType()
-            val body = matchedRoute.responseBody.toResponseBody(mediaType)
+            val mediaType = MediaType.parse("application/json")
+            val body = ResponseBody.create(mediaType, matchedRoute.responseBody)
 
             return Response.Builder()
                 .code(matchedRoute.statusCode)
@@ -871,8 +1285,21 @@ class MockApiInterceptor : Interceptor {{
                 .build()
         }}
 
-        // No mock match — pass through to real network
-        return chain.proceed(request)
+        // Fail closed: a mock build must never contact a real backend because a
+        // specification omitted an endpoint.
+        val unmatchedBody = ResponseBody.create(
+            MediaType.parse("application/json"),
+            """{{"error":"Mock route not found","path":"$path","code":404}}"""
+        )
+        return Response.Builder()
+            .code(404)
+            .message("Mock Route Not Found")
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .body(unmatchedBody)
+            .addHeader("Content-Type", "application/json")
+            .addHeader("X-Mock", "true")
+            .build()
     }}
 }}
 '''
@@ -1247,8 +1674,7 @@ async def cleanup_test_environment(project_path: str, package_name: str) -> dict
 # ============================================================
 @mcp.tool()
 async def clean_mocks(project_path: str) -> dict:
-    """Removes and recreates the /mocks directory to prevent stale state before E2E runs.
-    Also cleans generated MockApiInterceptor files from mockDebug source set."""
+    """Remove stale mock files and deactivate any temporary mock integration."""
     import shutil
 
     logger.info(f"clean_mocks: project={project_path}")
@@ -1260,19 +1686,23 @@ async def clean_mocks(project_path: str) -> dict:
 
     cleaned = []
 
+    deactivation = await deactivate_mock_environment(project_path)
+    if deactivation["status"] == "FAILURE":
+        return deactivation
+    if deactivation["status"] == "SUCCESS":
+        cleaned.extend(deactivation.get("cleaned", []))
+
     # Clean project-level mocks directory if it exists
     mocks_dir = os.path.join(project_path, "mocks")
     if os.path.exists(mocks_dir):
         shutil.rmtree(mocks_dir)
-        os.makedirs(mocks_dir, exist_ok=True)
-        cleaned.append(f"Removed and recreated: {mocks_dir}")
+        cleaned.append(f"Removed: {mocks_dir}")
 
     # Clean generated mock interceptor files from mockDebug source set
     mock_debug_dir = os.path.join(project_path, "app", "src", "mockDebug")
     if os.path.exists(mock_debug_dir):
         shutil.rmtree(mock_debug_dir)
-        os.makedirs(mock_debug_dir, exist_ok=True)
-        cleaned.append(f"Removed and recreated: {mock_debug_dir}")
+        cleaned.append(f"Removed: {mock_debug_dir}")
 
     if not cleaned:
         cleaned.append("No mock directories found to clean")
@@ -2328,5 +2758,21 @@ async def compare_screenshots(
         return {"status": "FAILURE", "error_output": str(e)}
 
 
+def _cleanup_stale_allowed_project_session() -> None:
+    """Best-effort cleanup on server startup/shutdown after an interrupted run."""
+    project_path = os.path.realpath(ALLOWED_PROJECT_ROOT)
+    if not os.path.isfile(_mock_manifest_path(project_path)):
+        return
+    try:
+        result = asyncio.run(deactivate_mock_environment(project_path))
+        logger.info(f"automatic mock cleanup: {result.get('status')}")
+    except Exception as exc:
+        logger.error(f"automatic mock cleanup failed: {exc}")
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    _cleanup_stale_allowed_project_session()
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        _cleanup_stale_allowed_project_session()

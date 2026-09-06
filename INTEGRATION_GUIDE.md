@@ -199,13 +199,21 @@ Package: com.example.myapp
 
 1. Reads `requirements.md` and `design.md`
 2. Asks whether to use the deployed real API or temporary mock responses
-3. Generates feature code after architecture approval
-4. Generates and activates mock wiring only when mock mode was explicitly selected
-5. Builds and tests the variant matching the selected API mode
-6. Resolves the actual connected ADB device (physical, network, or emulator)
-7. Generates and runs the Appium E2E test against that resolved serial
-8. On failure: captures UI state, fixes the issue, and retries
-9. Performs final cleanup and verifies that no temporary mock wiring remains
+3. Prepares a complete unified diff without modifying product source
+4. Posts the complete proposed diff in chat and ends the turn
+5. Waits for your next message to approve, reject, or request changes
+6. Resumes only after recording that next-message decision
+7. Generates and activates mock wiring only when mock mode was explicitly selected
+8. Builds and tests the variant matching the selected API mode
+9. Resolves the actual connected ADB device (physical, network, or emulator)
+10. Generates and runs the Appium E2E test against that resolved serial
+11. On failure: captures UI state, prepares a revised diff, and requests a new review
+12. Performs final cleanup and verifies that no temporary mock wiring remains
+
+The pending chat review persists for 24 hours. It does not authorize any source
+change. After your next chat message approves the proposal, the MCP issues an
+approval token bound to the exact project and diff; that token expires after 30
+minutes and works once. Any change to the diff requires a new chat review.
 
 ### The agent halts when:
 - All gates pass (success), OR
@@ -217,6 +225,9 @@ Package: com.example.myapp
 
 | Tool | Purpose |
 |------|---------|
+| `request_code_review(project_path, change_summary, proposed_diff)` | Persist the proposed diff, return it for display in chat, and require the AI to end its turn |
+| `record_code_review_decision(project_path, review_id, proposed_diff, decision, user_response, user_confirmed?)` | Resume on the user's next message; issue an apply token only for explicit approval |
+| `apply_reviewed_patch(project_path, proposed_diff, approval_token)` | Validate and apply the exact approved diff; rejects altered, expired, unsafe, or reused approvals |
 | `run_gradle(command, project_path, timeout_seconds?)` | Run whitelisted Gradle commands; timed-out process trees are terminated |
 | `generate_mock_interceptor(spec_path, package_name, output_dir)` | Generate OkHttp interceptor from spec |
 | `run_appium_test(test_script_path)` | Simple Appium test execution |
@@ -236,6 +247,8 @@ Package: com.example.myapp
 | "Gradle command not whitelisted" | Only commands in the allow-list work. Check steering rules for the full list. |
 | "Path outside allowed root" | Set `ANDROID_PROJECT_ROOT` env var to cover your project path |
 | "No module named 'mcp'" | Run `uv sync` in the MCP server directory |
+| `NEEDS_USER_DECISION` | End the current turn and wait for the user's next chat message before recording a decision |
+| "diff changed after approval" | Submit the complete current diff through `request_code_review` again |
 | Device timeout | Check `adb devices`; pass `device_serial` when multiple devices are online |
 | Appium not found | Install globally: `npm install -g appium` |
 | E2E flaky failures | Agent calls `cleanup_test_environment` between retries automatically |

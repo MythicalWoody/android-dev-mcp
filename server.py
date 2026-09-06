@@ -14,6 +14,18 @@ from PIL import Image
 import httpx
 
 MCP_INSTRUCTIONS = """
+Before changing product source code, prepare one complete unified diff and call
+request_code_review. Show its complete proposed_diff to the user in the chat,
+then end the turn immediately. Do not call record_code_review_decision in the
+same turn. On the user's next message, call record_code_review_decision with the
+decision and feedback they actually provided. Do not write, patch, or otherwise
+modify product source until that tool returns an approval token. Apply the exact
+reviewed diff only through apply_reviewed_patch; never reuse a token or alter the
+diff after approval. If the user rejects or requests changes, prepare a revised
+diff and repeat the chat-review checkpoint. Temporary MCP-owned mock wiring,
+generated test artifacts, build outputs, and cleanup operations are outside this
+product-source gate.
+
 Before any API-dependent implementation or test workflow, ask the user whether
 to use the deployed real API or temporary mock responses. Never infer the mode
 from the task, previous workflows, or API availability. After the user answers,
@@ -104,6 +116,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("AndroidAutoDev")
+
+# --- Mandatory product-source review gate ---
+CODE_REVIEW_TTL_SECONDS = 30 * 60
+PENDING_REVIEW_TTL_SECONDS = 24 * 60 * 60
+MAX_REVIEW_DIFF_BYTES = 512 * 1024
 
 # --- Allowed Gradle commands ---
 # Exact whitelist for known-safe commands
@@ -211,6 +228,176 @@ def validate_path(path: str, label: str = "path") -> str:
             f"Rejected {label}: '{resolved}' is outside allowed root '{ALLOWED_PROJECT_ROOT}'."
         )
     return resolved
+
+
+def _code_review_dir(project_path: str) -> str:
+    project_key = hashlib.sha256(project_path.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(LOG_DIR, "code-reviews", project_key)
+
+
+def _code_review_record_path(project_path: str, approval_token: str) -> str:
+    token_key = hashlib.sha256((approval_token or "").encode("utf-8")).hexdigest()
+    return os.path.join(_code_review_dir(project_path), f"{token_key}.json")
+
+
+def _pending_review_record_path(project_path: str, review_id: str) -> str:
+    review_key = hashlib.sha256((review_id or "").encode("utf-8")).hexdigest()
+    return os.path.join(_code_review_dir(project_path), "pending", f"{review_key}.json")
+
+
+def _validate_review_diff(proposed_diff: str) -> list[str]:
+    """Validate a text-only git diff and return its project-relative paths."""
+    if not proposed_diff or not proposed_diff.strip():
+        raise ValueError("The proposed unified diff is empty.")
+    diff_size = len(proposed_diff.encode("utf-8"))
+    if diff_size > MAX_REVIEW_DIFF_BYTES:
+        raise ValueError(
+            f"The proposed diff is {diff_size} bytes; the review limit is "
+            f"{MAX_REVIEW_DIFF_BYTES} bytes. Split it into smaller reviewable changes."
+        )
+    if "\x00" in proposed_diff or "GIT binary patch" in proposed_diff:
+        raise ValueError("Binary patches cannot pass manual code review; use a text-only diff.")
+
+    paths = []
+    for line in proposed_diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split()
+        if len(parts) != 4 or not parts[2].startswith("a/") or not parts[3].startswith("b/"):
+            raise ValueError(
+                "Diff paths must be unquoted project-relative paths without whitespace."
+            )
+        for raw_path in parts[2:4]:
+            relative_path = raw_path[2:]
+            components = relative_path.split("/")
+            if (
+                not relative_path
+                or os.path.isabs(relative_path)
+                or any(component in {"", ".", ".."} for component in components)
+                or components[0] == ".git"
+            ):
+                raise ValueError(f"Unsafe path in proposed diff: {raw_path}")
+        paths.append(parts[3][2:])
+
+    if not paths:
+        raise ValueError(
+            "Expected a git-style unified diff containing at least one 'diff --git a/... b/...' header."
+        )
+    return list(dict.fromkeys(paths))
+
+
+def _store_code_review(
+    project_path: str,
+    change_summary: str,
+    proposed_diff: str,
+) -> tuple[str, dict]:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now().timestamp()
+    record = {
+        "project_path": project_path,
+        "change_summary": change_summary,
+        "diff_sha256": hashlib.sha256(proposed_diff.encode("utf-8")).hexdigest(),
+        "state": "approved",
+        "approved_at": datetime.now().isoformat(),
+        "expires_at_epoch": now + CODE_REVIEW_TTL_SECONDS,
+    }
+    record_path = _code_review_record_path(project_path, token)
+    os.makedirs(os.path.dirname(record_path), exist_ok=True)
+    _write_text_atomic(record_path, json.dumps(record, indent=2))
+    return token, record
+
+
+def _store_pending_review(
+    project_path: str,
+    change_summary: str,
+    proposed_diff: str,
+    changed_files: list[str],
+) -> tuple[str, dict]:
+    review_id = secrets.token_urlsafe(24)
+    now = datetime.now().timestamp()
+    record = {
+        "project_path": project_path,
+        "change_summary": change_summary,
+        "diff_sha256": hashlib.sha256(proposed_diff.encode("utf-8")).hexdigest(),
+        "changed_files": changed_files,
+        "state": "awaiting_user_review",
+        "created_at": datetime.now().isoformat(),
+        "expires_at_epoch": now + PENDING_REVIEW_TTL_SECONDS,
+    }
+    record_path = _pending_review_record_path(project_path, review_id)
+    os.makedirs(os.path.dirname(record_path), exist_ok=True)
+    _write_text_atomic(record_path, json.dumps(record, indent=2))
+    return review_id, record
+
+
+def _load_pending_review(
+    project_path: str,
+    review_id: str,
+    proposed_diff: str,
+) -> tuple[str, dict]:
+    if not review_id:
+        raise ValueError("Missing review_id. Call request_code_review first.")
+    record_path = _pending_review_record_path(project_path, review_id)
+    if not os.path.isfile(record_path):
+        raise ValueError("Invalid or already-resolved review_id.")
+    with open(record_path, "r") as handle:
+        record = json.load(handle)
+    if record.get("project_path") != project_path:
+        raise ValueError("The review belongs to a different project.")
+    if record.get("state") != "awaiting_user_review":
+        raise ValueError("This chat review has already been resolved.")
+    if datetime.now().timestamp() > float(record.get("expires_at_epoch", 0)):
+        raise ValueError("The chat review expired. Submit the current diff for review again.")
+    actual_hash = hashlib.sha256(proposed_diff.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(record.get("diff_sha256", ""), actual_hash):
+        raise ValueError("The diff changed while awaiting review. Start a new chat review.")
+    return record_path, record
+
+
+def _authorize_reviewed_diff(
+    project_path: str,
+    proposed_diff: str,
+    approval_token: str,
+) -> tuple[str, dict]:
+    if not approval_token:
+        raise ValueError("Missing approval token. Call request_code_review first.")
+    record_path = _code_review_record_path(project_path, approval_token)
+    if not os.path.isfile(record_path):
+        raise ValueError("Invalid or already-consumed approval token.")
+    with open(record_path, "r") as handle:
+        record = json.load(handle)
+    if record.get("project_path") != project_path:
+        raise ValueError("The approval token belongs to a different project.")
+    if record.get("state") != "approved":
+        raise ValueError("The approval token is already being used or has been consumed.")
+    if datetime.now().timestamp() > float(record.get("expires_at_epoch", 0)):
+        raise ValueError("The approval token expired. Review the current diff again.")
+    actual_hash = hashlib.sha256(proposed_diff.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(record.get("diff_sha256", ""), actual_hash):
+        raise ValueError("The diff changed after approval. Submit the new diff for review.")
+    return record_path, record
+
+
+def _set_code_review_state(record_path: str, record: dict, state: str) -> None:
+    record["state"] = state
+    record[f"{state}_at"] = datetime.now().isoformat()
+    _write_text_atomic(record_path, json.dumps(record, indent=2))
+
+
+async def _git_apply(project_path: str, proposed_diff: str, check_only: bool) -> tuple[int, str]:
+    command = ["git", "-C", project_path, "apply"]
+    if check_only:
+        command.append("--check")
+    command.extend(["--whitespace=nowarn", "-"])
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate(proposed_diff.encode("utf-8"))
+    output = (stdout + stderr).decode(errors="replace").strip()
+    return process.returncode, output
 
 
 # --- Temporary mock integration lifecycle ---
@@ -996,7 +1183,205 @@ def _generate_fallback_response(method: str, path: str) -> str:
 
 
 # ============================================================
-# TOOL 2: Select API Mode (Mandatory User Choice)
+# TOOL 2: Request Mandatory Manual Code Review
+# ============================================================
+@mcp.tool()
+async def request_code_review(
+    project_path: str,
+    change_summary: str,
+    proposed_diff: str,
+) -> dict:
+    """Create a persistent chat checkpoint for an exact product-source diff.
+
+    Call this before making any product-source edit. After it returns, show the
+    proposed_diff verbatim in chat and END THE TURN. Wait for the user's next
+    message. Do not call record_code_review_decision during the same turn.
+    """
+    try:
+        project_path = validate_path(project_path, "project_path")
+        changed_files = _validate_review_diff(proposed_diff)
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    summary = (change_summary or "").strip()
+    if not summary:
+        return {"status": "FAILURE", "error_output": "change_summary is required."}
+
+    review_id, record = _store_pending_review(
+        project_path, summary, proposed_diff, changed_files
+    )
+    logger.info(
+        "request_code_review: awaiting chat response project=%s diff=%s files=%s",
+        project_path,
+        record["diff_sha256"],
+        changed_files,
+    )
+    return {
+        "status": "AWAITING_USER_REVIEW",
+        "review_id": review_id,
+        "diff_sha256": record["diff_sha256"],
+        "changed_files": changed_files,
+        "change_summary": summary,
+        "proposed_diff": proposed_diff,
+        "expires_in_seconds": PENDING_REVIEW_TTL_SECONDS,
+        "message": (
+            "Show change_summary and proposed_diff to the user in chat, ask them to "
+            "reply with approve or requested changes, and END THIS TURN. No source "
+            "change is authorized yet."
+        ),
+    }
+
+
+# ============================================================
+# TOOL 3: Record the User's Next-Message Review Decision
+# ============================================================
+@mcp.tool()
+async def record_code_review_decision(
+    project_path: str,
+    review_id: str,
+    proposed_diff: str,
+    decision: str,
+    user_response: str,
+    user_confirmed: bool = False,
+) -> dict:
+    """Resume a pending review using the user's decision from their next message.
+
+    Call only in a later turn after request_code_review has halted for chat review.
+    Relay the user's actual response in user_response and set user_confirmed=true.
+    decision must be approve, request_changes, or reject. Only approve creates a
+    short-lived token for apply_reviewed_patch.
+    """
+    try:
+        project_path = validate_path(project_path, "project_path")
+        _validate_review_diff(proposed_diff)
+        record_path, record = _load_pending_review(
+            project_path, review_id, proposed_diff
+        )
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    normalized_decision = (decision or "").strip().lower()
+    if not user_confirmed or not (user_response or "").strip():
+        return {
+            "status": "NEEDS_USER_DECISION",
+            "message": (
+                "Wait for the user's next chat message, then relay their actual "
+                "response with user_confirmed=true."
+            ),
+        }
+    if normalized_decision not in {"approve", "request_changes", "reject"}:
+        return {
+            "status": "FAILURE",
+            "error_output": "decision must be approve, request_changes, or reject.",
+        }
+
+    record["user_response"] = user_response.strip()
+    if normalized_decision == "approve":
+        approval_token, approval = _store_code_review(
+            project_path,
+            record["change_summary"],
+            proposed_diff,
+        )
+        _set_code_review_state(record_path, record, "approved_in_chat")
+        logger.info(
+            "record_code_review_decision: approved project=%s diff=%s",
+            project_path,
+            record["diff_sha256"],
+        )
+        return {
+            "status": "APPROVED",
+            "approval_token": approval_token,
+            "diff_sha256": approval["diff_sha256"],
+            "expires_in_seconds": CODE_REVIEW_TTL_SECONDS,
+            "message": "Resume the workflow and apply this exact diff once.",
+        }
+
+    resolved_state = (
+        "changes_requested_in_chat"
+        if normalized_decision == "request_changes"
+        else "rejected_in_chat"
+    )
+    _set_code_review_state(record_path, record, resolved_state)
+    return {
+        "status": (
+            "CHANGES_REQUESTED"
+            if normalized_decision == "request_changes"
+            else "REJECTED"
+        ),
+        "feedback": user_response.strip(),
+        "message": (
+            "Do not apply this diff. Prepare a revised proposal and start a new "
+            "chat review."
+            if normalized_decision == "request_changes"
+            else "Do not apply this diff. The review is closed."
+        ),
+    }
+
+
+# ============================================================
+# TOOL 4: Apply an Approved Code Diff
+# ============================================================
+@mcp.tool()
+async def apply_reviewed_patch(
+    project_path: str,
+    proposed_diff: str,
+    approval_token: str,
+) -> dict:
+    """Apply exactly the product-source diff approved by request_code_review.
+
+    The token is project-bound, diff-bound, expires after 30 minutes, and can be
+    consumed only once. The patch is path-validated and checked by git before any
+    file is changed.
+    """
+    try:
+        project_path = validate_path(project_path, "project_path")
+        changed_files = _validate_review_diff(proposed_diff)
+        record_path, record = _authorize_reviewed_diff(
+            project_path, proposed_diff, approval_token
+        )
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    _set_code_review_state(record_path, record, "applying")
+    try:
+        returncode, output = await _git_apply(project_path, proposed_diff, check_only=True)
+        if returncode != 0:
+            _set_code_review_state(record_path, record, "approved")
+            return {
+                "status": "FAILURE",
+                "error_output": f"Reviewed patch no longer applies cleanly: {output}",
+                "message": "No files were changed. Resolve the conflict and request a new review.",
+            }
+
+        returncode, output = await _git_apply(project_path, proposed_diff, check_only=False)
+        if returncode != 0:
+            _set_code_review_state(record_path, record, "approved")
+            return {
+                "status": "FAILURE",
+                "error_output": f"git apply failed: {output}",
+                "message": "The token remains valid for the exact same diff until it expires.",
+            }
+    except Exception as exc:
+        _set_code_review_state(record_path, record, "approved")
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    _set_code_review_state(record_path, record, "consumed")
+    logger.info(
+        "apply_reviewed_patch: applied project=%s diff=%s files=%s",
+        project_path,
+        record["diff_sha256"],
+        changed_files,
+    )
+    return {
+        "status": "SUCCESS",
+        "changed_files": changed_files,
+        "diff_sha256": record["diff_sha256"],
+        "message": "The exact manually reviewed diff was applied; its token is now consumed.",
+    }
+
+
+# ============================================================
+# TOOL 5: Select API Mode (Mandatory User Choice)
 # ============================================================
 @mcp.tool()
 async def select_api_mode(

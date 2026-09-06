@@ -119,5 +119,134 @@ class MockCleanupTests(unittest.TestCase):
             self.assertEqual(server._temporary_mock_artifacts(project), [])
 
 
+class CodeReviewGateTests(unittest.IsolatedAsyncioTestCase):
+    SAFE_DIFF = (
+        "diff --git a/app/src/main/Example.kt b/app/src/main/Example.kt\n"
+        "--- a/app/src/main/Example.kt\n"
+        "+++ b/app/src/main/Example.kt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    async def test_review_and_apply_exact_diff_once(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as log_dir:
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", project), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                review = await server.request_code_review(
+                    project,
+                    "Update Example",
+                    self.SAFE_DIFF,
+                )
+                self.assertEqual(review["status"], "AWAITING_USER_REVIEW")
+                self.assertEqual(review["proposed_diff"], self.SAFE_DIFF)
+                self.assertNotIn("approval_token", review)
+
+                premature = await server.record_code_review_decision(
+                    project,
+                    review["review_id"],
+                    self.SAFE_DIFF,
+                    "approve",
+                    "",
+                    user_confirmed=False,
+                )
+                self.assertEqual(premature["status"], "NEEDS_USER_DECISION")
+
+                decision = await server.record_code_review_decision(
+                    project,
+                    review["review_id"],
+                    self.SAFE_DIFF,
+                    "approve",
+                    "approve",
+                    user_confirmed=True,
+                )
+                self.assertEqual(decision["status"], "APPROVED")
+
+                with mock.patch(
+                    "server._git_apply",
+                    new=mock.AsyncMock(return_value=(0, "")),
+                ) as git_apply:
+                    applied = await server.apply_reviewed_patch(
+                        project,
+                        self.SAFE_DIFF,
+                        decision["approval_token"],
+                    )
+                    reused = await server.apply_reviewed_patch(
+                        project,
+                        self.SAFE_DIFF,
+                        decision["approval_token"],
+                    )
+
+                self.assertEqual(applied["status"], "SUCCESS")
+                self.assertEqual(git_apply.await_count, 2)
+                self.assertEqual(reused["status"], "FAILURE")
+                self.assertIn("consumed", reused["error_output"])
+
+    async def test_change_request_closes_review_without_approval(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as log_dir:
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", project), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                review = await server.request_code_review(
+                    project, "Update Example", self.SAFE_DIFF
+                )
+                decision = await server.record_code_review_decision(
+                    project,
+                    review["review_id"],
+                    self.SAFE_DIFF,
+                    "request_changes",
+                    "Please rename the method.",
+                    user_confirmed=True,
+                )
+
+                self.assertEqual(decision["status"], "CHANGES_REQUESTED")
+                self.assertEqual(decision["feedback"], "Please rename the method.")
+                self.assertNotIn("approval_token", decision)
+
+    async def test_changed_diff_cannot_resolve_pending_review(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as log_dir:
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", project), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                review = await server.request_code_review(
+                    project, "Update Example", self.SAFE_DIFF
+                )
+                decision = await server.record_code_review_decision(
+                    project,
+                    review["review_id"],
+                    self.SAFE_DIFF.replace("+new", "+different"),
+                    "approve",
+                    "approve",
+                    user_confirmed=True,
+                )
+
+                self.assertEqual(decision["status"], "FAILURE")
+                self.assertIn("changed while awaiting review", decision["error_output"])
+
+    async def test_changed_diff_cannot_use_approval_token(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as log_dir:
+            with mock.patch.object(server, "LOG_DIR", log_dir):
+                token, _ = server._store_code_review(
+                    project, "Update Example", self.SAFE_DIFF
+                )
+                with self.assertRaisesRegex(ValueError, "changed after approval"):
+                    server._authorize_reviewed_diff(
+                        project,
+                        self.SAFE_DIFF.replace("+new", "+different"),
+                        token,
+                    )
+
+    def test_rejects_path_traversal_and_binary_patches(self):
+        traversal = self.SAFE_DIFF.replace(
+            "a/app/src/main/Example.kt b/app/src/main/Example.kt",
+            "a/../secret b/../secret",
+        )
+        with self.assertRaisesRegex(ValueError, "Unsafe path"):
+            server._validate_review_diff(traversal)
+        with self.assertRaisesRegex(ValueError, "Binary patches"):
+            server._validate_review_diff(self.SAFE_DIFF + "GIT binary patch\n")
+
+
 if __name__ == "__main__":
     unittest.main()

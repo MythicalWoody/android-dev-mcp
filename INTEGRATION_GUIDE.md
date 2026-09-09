@@ -175,7 +175,7 @@ inside an individual project's `.kiro/settings/mcp.json`:
   "mcpServers": {
     "android-auto-dev": {
       "command": "uv",
-      "args": ["run", "--directory", "/Users/shivam.singh28/kiro-mcp-server", "python", "server.py"],
+      "args": ["run", "--directory", "/Users/shivam.singh28/android-dev-mcp", "python", "server.py"],
       "env": {
         "ANDROID_PROJECT_ROOT": "/Users/shivam.singh28/StudioProjects"
       },

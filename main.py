@@ -1,5 +1,5 @@
 def main():
-    print("Hello from kiro-mcp-server!")
+    print("Hello from android-dev-mcp!")
 
 
 if __name__ == "__main__":

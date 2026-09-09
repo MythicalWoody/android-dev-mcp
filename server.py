@@ -3513,21 +3513,50 @@ async def compare_screenshots(
         return {"status": "FAILURE", "error_output": str(e)}
 
 
-def _cleanup_stale_allowed_project_session() -> None:
-    """Best-effort cleanup on server startup/shutdown after an interrupted run."""
-    project_path = os.path.realpath(ALLOWED_PROJECT_ROOT)
-    if not os.path.isfile(_mock_manifest_path(project_path)):
-        return
-    try:
-        result = asyncio.run(deactivate_mock_environment(project_path))
-        logger.info(f"automatic mock cleanup: {result.get('status')}")
-    except Exception as exc:
-        logger.error(f"automatic mock cleanup failed: {exc}")
+def _active_mock_projects() -> list[str]:
+    """Discover active mock sessions for projects below the shared allowed root."""
+    sessions_root = os.path.join(LOG_DIR, "sessions")
+    if not os.path.isdir(sessions_root):
+        return []
+
+    projects = []
+    for entry in os.scandir(sessions_root):
+        manifest_path = os.path.join(entry.path, "manifest.json")
+        if not entry.is_dir() or not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r") as handle:
+                manifest = json.load(handle)
+            recorded_project = manifest.get("project_path")
+            if not isinstance(recorded_project, str) or not recorded_project.strip():
+                raise ValueError("manifest has no project_path")
+            project_path = validate_path(recorded_project, "project_path")
+            if os.path.realpath(_mock_manifest_path(project_path)) != os.path.realpath(manifest_path):
+                logger.warning("ignored mismatched mock manifest: %s", manifest_path)
+                continue
+            projects.append(project_path)
+        except Exception as exc:
+            logger.warning("ignored invalid mock manifest %s: %s", manifest_path, exc)
+    return list(dict.fromkeys(projects))
+
+
+def _cleanup_stale_allowed_project_sessions() -> None:
+    """Best-effort cleanup for every interrupted project below the shared root."""
+    for project_path in _active_mock_projects():
+        try:
+            result = asyncio.run(deactivate_mock_environment(project_path))
+            logger.info(
+                "automatic mock cleanup: project=%s status=%s",
+                project_path,
+                result.get("status"),
+            )
+        except Exception as exc:
+            logger.error("automatic mock cleanup failed for %s: %s", project_path, exc)
 
 
 if __name__ == "__main__":
-    _cleanup_stale_allowed_project_session()
+    _cleanup_stale_allowed_project_sessions()
     try:
         mcp.run(transport="stdio")
     finally:
-        _cleanup_stale_allowed_project_session()
+        _cleanup_stale_allowed_project_sessions()

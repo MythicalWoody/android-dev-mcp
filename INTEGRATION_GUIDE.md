@@ -156,15 +156,19 @@ The agent reads these to generate mocks and validate behavior.
 
 ---
 
-## Step 5: Set the Project Root Environment Variable
+## Step 5: Configure the MCP Once for All Projects
 
-The MCP server whitelists paths under `ANDROID_PROJECT_ROOT`. Set it to cover your Android project:
+The MCP server whitelists paths under `ANDROID_PROJECT_ROOT`. Point it at the
+shared parent directory that contains your Android projects, rather than one
+specific project. For the standard Android Studio layout:
 
 ```bash
-export ANDROID_PROJECT_ROOT="/Users/shivam.singh28"
+export ANDROID_PROJECT_ROOT="/Users/shivam.singh28/StudioProjects"
 ```
 
-Or update the MCP config to pass it:
+Register the server in the global Kiro configuration at
+`~/.kiro/settings/mcp.json` (and in `~/.codex/config.toml` when using Codex), not
+inside an individual project's `.kiro/settings/mcp.json`:
 
 ```json
 {
@@ -173,7 +177,7 @@ Or update the MCP config to pass it:
       "command": "uv",
       "args": ["run", "--directory", "/Users/shivam.singh28/kiro-mcp-server", "python", "server.py"],
       "env": {
-        "ANDROID_PROJECT_ROOT": "/Users/shivam.singh28"
+        "ANDROID_PROJECT_ROOT": "/Users/shivam.singh28/StudioProjects"
       },
       "disabled": false,
       "autoApprove": []
@@ -181,6 +185,10 @@ Or update the MCP config to pass it:
   }
 }
 ```
+
+This single registration works for every project below `StudioProjects`. Pass
+the current project's absolute path to each MCP tool; no per-project MCP setting
+change is required.
 
 ---
 

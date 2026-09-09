@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -117,6 +118,40 @@ class MockCleanupTests(unittest.TestCase):
             with open(source) as handle:
                 self.assertEqual(handle.read(), "before\nafter\n")
             self.assertEqual(server._temporary_mock_artifacts(project), [])
+
+    def test_discovers_mock_sessions_across_shared_project_root(self):
+        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as log_dir:
+            allowed_root = os.path.realpath(allowed_root)
+            projects = [
+                os.path.join(allowed_root, "project-one"),
+                os.path.join(allowed_root, "project-two"),
+            ]
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", allowed_root), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                for project in projects:
+                    os.makedirs(project)
+                    manifest_path = server._mock_manifest_path(project)
+                    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+                    with open(manifest_path, "w") as handle:
+                        json.dump({"project_path": project}, handle)
+
+                self.assertCountEqual(server._active_mock_projects(), projects)
+
+    def test_ignores_mock_session_outside_shared_project_root(self):
+        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as log_dir:
+            allowed_root = os.path.realpath(allowed_root)
+            outside_project = os.path.join(log_dir, "outside-project")
+            os.makedirs(outside_project)
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", allowed_root), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                manifest_path = server._mock_manifest_path(outside_project)
+                os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+                with open(manifest_path, "w") as handle:
+                    json.dump({"project_path": outside_project}, handle)
+
+                self.assertEqual(server._active_mock_projects(), [])
 
 
 class CodeReviewGateTests(unittest.IsolatedAsyncioTestCase):

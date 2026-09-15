@@ -207,21 +207,30 @@ Package: com.example.myapp
 
 1. Reads `requirements.md` and `design.md`
 2. Asks whether to use the deployed real API or temporary mock responses
-3. Prepares a complete unified diff without modifying product source
-4. Posts the complete proposed diff in chat and ends the turn
-5. Waits for your next message to approve, reject, or request changes
-6. Resumes only after recording that next-message decision
-7. Generates and activates mock wiring only when mock mode was explicitly selected
-8. Builds and tests the variant matching the selected API mode
-9. Resolves the actual connected ADB device (physical, network, or emulator)
-10. Generates and runs the Appium E2E test against that resolved serial
-11. On failure: captures UI state, prepares a revised diff, and requests a new review
-12. Performs final cleanup and verifies that no temporary mock wiring remains
+3. Uses UAT Debug for routine integration testing unless you explicitly request another environment
+4. Creates an MCP-managed temporary review workspace outside the Android project
+5. Prepares and compiles the proposed changes only in that temporary workspace
+6. Submits the complete unified diff and removes the temporary workspace
+7. Posts the highlighted proposed diff in chat and ends the turn
+8. Waits for your next message to approve, reject, or request changes
+9. Resumes only after recording that next-message decision
+10. Generates and activates mock wiring only when mock mode was explicitly selected
+11. Builds and tests the authorized variant
+12. Resolves the actual connected ADB device (physical, network, or emulator)
+13. Generates and runs the Appium E2E test against that resolved serial
+14. On failure: captures UI state, prepares a revised diff, and requests a new review
+15. Performs final cleanup and verifies that no temporary mock wiring remains
 
 The pending chat review persists for 24 hours. It does not authorize any source
 change. After your next chat message approves the proposal, the MCP issues an
 approval token bound to the exact project and diff; that token expires after 30
 minutes and works once. Any change to the diff requires a new chat review.
+
+UAT Debug is the default environment for day-to-day integration work. The agent
+must not substitute Development, Staging, Production, Release, or another build
+variant unless you explicitly request it in the current chat. If UAT Debug does
+not exist in the project, the agent must stop and ask. Explicitly choosing mock
+API mode authorizes that workflow's Mock Debug variant.
 
 ### The agent halts when:
 - All gates pass (success), OR
@@ -233,7 +242,9 @@ minutes and works once. Any change to the diff requires a new chat review.
 
 | Tool | Purpose |
 |------|---------|
-| `request_code_review(project_path, change_summary, proposed_diff)` | Persist the proposed diff, return it for display in chat, and require the AI to end its turn |
+| `prepare_code_review_workspace(project_path)` | Create an isolated MCP-managed project copy under the temporary log area for pre-approval editing and compilation |
+| `cleanup_code_review_workspace(project_path, review_workspace_path)` | Remove a managed proposal workspace without touching the Android project |
+| `request_code_review(project_path, change_summary, proposed_diff, review_workspace_path?)` | Persist the proposed diff, clean its managed workspace, return a syntax-highlighted Markdown `diff` block, and require the AI to end its turn |
 | `record_code_review_decision(project_path, review_id, proposed_diff, decision, user_response, user_confirmed?)` | Resume on the user's next message; issue an apply token only for explicit approval |
 | `apply_reviewed_patch(project_path, proposed_diff, approval_token)` | Validate and apply the exact approved diff; rejects altered, expired, unsafe, or reused approvals |
 | `run_gradle(command, project_path, timeout_seconds?)` | Run whitelisted Gradle commands; timed-out process trees are terminated |
@@ -257,6 +268,8 @@ minutes and works once. Any change to the diff requires a new chat review.
 | "No module named 'mcp'" | Run `uv sync` in the MCP server directory |
 | `NEEDS_USER_DECISION` | End the current turn and wait for the user's next chat message before recording a decision |
 | "diff changed after approval" | Submit the complete current diff through `request_code_review` again |
+| Review appears as plain text | Display the tool's `review_markdown` field verbatim; its fenced `diff` block highlights additions and removals in compatible chat clients |
+| Temporary proposal files appear in the Android project | Use `prepare_code_review_workspace`; never create `.android-auto-review` or `android-auto-review-copy` inside the project |
 | Device timeout | Check `adb devices`; pass `device_serial` when multiple devices are online |
 | Appium not found | Install globally: `npm install -g appium` |
 | E2E flaky failures | Agent calls `cleanup_test_environment` between retries automatically |

@@ -15,16 +15,23 @@ import httpx
 
 MCP_INSTRUCTIONS = """
 Before changing product source code, prepare one complete unified diff and call
-request_code_review. Show its complete proposed_diff to the user in the chat,
-then end the turn immediately. Do not call record_code_review_decision in the
-same turn. On the user's next message, call record_code_review_decision with the
-decision and feedback they actually provided. Do not write, patch, or otherwise
-modify product source until that tool returns an approval token. Apply the exact
-reviewed diff only through apply_reviewed_patch; never reuse a token or alter the
-diff after approval. If the user rejects or requests changes, prepare a revised
-diff and repeat the chat-review checkpoint. Temporary MCP-owned mock wiring,
-generated test artifacts, build outputs, and cleanup operations are outside this
-product-source gate.
+request_code_review. If proposal edits or compilation are needed first, call
+prepare_code_review_workspace and make those edits only in the returned temporary
+workspace. Never create a proposal copy inside the Android project. Pass the
+temporary workspace to run_gradle, then pass it as review_workspace_path to
+request_code_review so it is cleaned before the review is shown. Show the
+complete review_markdown to the user verbatim in the chat so additions render
+green and removals render red, then end the turn immediately. Do not replace the
+diff fence with a plain-text block. Do not call record_code_review_decision in
+the same turn. On the user's next message, call record_code_review_decision with
+the decision and feedback they actually provided. Use the raw proposed_diff,
+not review_markdown, when resolving or applying a review. Do not write, patch,
+or otherwise modify product source until that tool returns an approval token.
+Apply the exact reviewed diff only through apply_reviewed_patch; never reuse a
+token or alter the diff after approval. If the user rejects or requests changes,
+prepare a revised diff and repeat the chat-review checkpoint. Temporary
+MCP-owned mock wiring, generated test artifacts, build outputs, and cleanup
+operations are outside this product-source gate.
 
 Before any API-dependent implementation or test workflow, ask the user whether
 to use the deployed real API or temporary mock responses. Never infer the mode
@@ -33,6 +40,13 @@ call select_api_mode with user_confirmed=true. Use the real API without adding
 mock code when mode is real. Call activate_mock_environment only when mode is
 mock, and pass the one-time selection token returned by select_api_mode. Always
 deactivate temporary mocks during final cleanup.
+
+For day-to-day integration testing, always build, install, and test the UAT Debug
+variant. Do not use Development, Staging, Production, Release, or any other
+environment or build variant unless the user explicitly requests that different
+environment in the current chat. If the project has no UAT Debug variant, stop
+and ask the user; never silently substitute another variant. An explicit mock API
+selection authorizes the corresponding Mock Debug variant for that workflow.
 
 For device work, resolve the actual online ADB serial and pass it through every
 ADB/Appium operation; never assume emulator-5554. Never guess when multiple
@@ -121,6 +135,7 @@ logger = logging.getLogger("AndroidAutoDev")
 CODE_REVIEW_TTL_SECONDS = 30 * 60
 PENDING_REVIEW_TTL_SECONDS = 24 * 60 * 60
 MAX_REVIEW_DIFF_BYTES = 512 * 1024
+REVIEW_WORKSPACE_TTL_SECONDS = 6 * 60 * 60
 
 # --- Allowed Gradle commands ---
 # Exact whitelist for known-safe commands
@@ -230,6 +245,155 @@ def validate_path(path: str, label: str = "path") -> str:
     return resolved
 
 
+def _review_workspaces_root() -> str:
+    return os.path.join(LOG_DIR, "review-workspaces")
+
+
+def _review_workspace_manifest_path(workspace_path: str) -> str:
+    return os.path.join(os.path.dirname(workspace_path), "manifest.json")
+
+
+def _load_review_workspace(workspace_path: str) -> tuple[str, dict]:
+    """Validate an MCP-created review workspace and return its manifest."""
+    resolved_workspace = os.path.realpath(workspace_path)
+    workspaces_root = os.path.realpath(_review_workspaces_root())
+    try:
+        inside_managed_root = (
+            os.path.commonpath([resolved_workspace, workspaces_root]) == workspaces_root
+        )
+    except ValueError:
+        inside_managed_root = False
+    if not inside_managed_root or resolved_workspace == workspaces_root:
+        raise ValueError("The review workspace is not managed by AndroidAutoDev.")
+
+    manifest_path = _review_workspace_manifest_path(resolved_workspace)
+    if not os.path.isfile(manifest_path):
+        raise ValueError("The review workspace has no valid MCP manifest.")
+    with open(manifest_path, "r") as handle:
+        manifest = json.load(handle)
+
+    recorded_workspace = os.path.realpath(str(manifest.get("workspace_path", "")))
+    if recorded_workspace != resolved_workspace:
+        raise ValueError("The review workspace path does not match its MCP manifest.")
+    project_path = validate_path(str(manifest.get("project_path", "")), "project_path")
+    if manifest.get("state") != "active":
+        raise ValueError("The review workspace is no longer active.")
+    if datetime.now().timestamp() > float(manifest.get("expires_at_epoch", 0)):
+        raise ValueError("The review workspace expired; prepare a new workspace.")
+
+    manifest["project_path"] = project_path
+    return manifest_path, manifest
+
+
+def _validate_gradle_project_path(project_path: str) -> str:
+    """Allow real projects and registered MCP review workspaces only."""
+    try:
+        return validate_path(project_path, "project_path")
+    except ValueError as project_error:
+        try:
+            _manifest_path, manifest = _load_review_workspace(project_path)
+            return os.path.realpath(manifest["workspace_path"])
+        except (ValueError, OSError, json.JSONDecodeError):
+            raise project_error
+
+
+def _remove_review_workspace(workspace_path: str) -> None:
+    manifest_path, _manifest = _load_review_workspace(workspace_path)
+    session_dir = os.path.realpath(os.path.dirname(manifest_path))
+    workspaces_root = os.path.realpath(_review_workspaces_root())
+    if os.path.commonpath([session_dir, workspaces_root]) != workspaces_root:
+        raise ValueError("Refusing to remove a review workspace outside the managed root.")
+    shutil.rmtree(session_dir)
+
+
+def _cleanup_review_workspaces(
+    remove_all: bool = False,
+    owner_pid: int | None = None,
+) -> list[str]:
+    """Remove expired workspaces or those owned by a terminating MCP process."""
+    root = _review_workspaces_root()
+    if not os.path.isdir(root):
+        return []
+
+    removed = []
+    now = datetime.now().timestamp()
+    for entry in os.scandir(root):
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        manifest_path = os.path.join(entry.path, "manifest.json")
+        try:
+            with open(manifest_path, "r") as handle:
+                manifest = json.load(handle)
+            workspace_path = os.path.realpath(str(manifest.get("workspace_path", "")))
+            expected_workspace = os.path.realpath(os.path.join(entry.path, "workspace"))
+            expired = now > float(manifest.get("expires_at_epoch", 0))
+            owned_by_process = owner_pid is not None and manifest.get("owner_pid") == owner_pid
+            if workspace_path != expected_workspace:
+                logger.warning("ignored mismatched review workspace: %s", entry.path)
+                continue
+            if remove_all or expired or owned_by_process:
+                shutil.rmtree(entry.path)
+                removed.append(workspace_path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("ignored invalid review workspace %s: %s", entry.path, exc)
+    return removed
+
+
+def _review_copy_ignore(source_project: str):
+    source_project = os.path.realpath(source_project)
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = {
+            name
+            for name in names
+            if name in {".git", "build", ".gradle", ".kotlin"}
+        }
+        if os.path.realpath(directory) == source_project:
+            ignored.update(
+                name
+                for name in names
+                if name in {
+                    ".android-auto-review",
+                    "android-auto-review-copy",
+                }
+            )
+        return ignored
+
+    return ignore
+
+
+async def _initialize_review_workspace_git(workspace_path: str) -> None:
+    """Create private Git metadata and commit the copied tree as its diff baseline."""
+    commands = (
+        ("git", "init", "--quiet", workspace_path),
+        ("git", "-C", workspace_path, "add", "--all"),
+        (
+            "git",
+            "-C",
+            workspace_path,
+            "-c",
+            "user.name=AndroidAutoDev",
+            "-c",
+            "user.email=android-autodev@localhost",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "AndroidAutoDev review baseline",
+        ),
+    )
+    for command in commands:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            output = (stdout + stderr).decode(errors="replace").strip()
+            raise RuntimeError(f"Could not initialize review Git baseline: {output}")
+
+
 def _code_review_dir(project_path: str) -> str:
     project_key = hashlib.sha256(project_path.encode("utf-8")).hexdigest()[:16]
     return os.path.join(LOG_DIR, "code-reviews", project_key)
@@ -284,6 +448,27 @@ def _validate_review_diff(proposed_diff: str) -> list[str]:
             "Expected a git-style unified diff containing at least one 'diff --git a/... b/...' header."
         )
     return list(dict.fromkeys(paths))
+
+
+def _format_review_diff_markdown(proposed_diff: str) -> str:
+    """Wrap a raw patch in a safe Markdown diff fence for chat rendering."""
+    longest_backtick_run = 0
+    current_run = 0
+    for character in proposed_diff:
+        if character == "`":
+            current_run += 1
+            longest_backtick_run = max(longest_backtick_run, current_run)
+        else:
+            current_run = 0
+
+    fence = "`" * max(3, longest_backtick_run + 1)
+    trailing_newline = "" if proposed_diff.endswith("\n") else "\n"
+    return (
+        "### Proposed code changes\n\n"
+        "Lines beginning with `+` are additions; lines beginning with `-` are removals.\n\n"
+        f"{fence}diff\n{proposed_diff}{trailing_newline}{fence}\n\n"
+        "Reply with **approve**, **reject**, or the changes you want."
+    )
 
 
 def _store_code_review(
@@ -678,11 +863,108 @@ async def _ensure_emulator_ready(device_serial: str | None = None) -> str:
 
 
 # ============================================================
-# TOOL 1: Execute Gradle Commands (Whitelisted)
+# TOOL 1: Prepare an Isolated Code-Review Workspace
+# ============================================================
+@mcp.tool()
+async def prepare_code_review_workspace(project_path: str) -> dict:
+    """Copy a project into an MCP-managed temporary workspace for proposal work.
+
+    Make all pre-approval proposal edits and compilation attempts in the returned
+    workspace_path. Never create a review copy inside the Android project.
+    """
+    try:
+        project_path = validate_path(project_path, "project_path")
+    except ValueError as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+    if not os.path.isdir(project_path):
+        return {"status": "FAILURE", "error_output": "The project path is not a directory."}
+
+    _cleanup_review_workspaces()
+    session_id = secrets.token_hex(16)
+    session_dir = os.path.realpath(os.path.join(_review_workspaces_root(), session_id))
+    workspace_path = os.path.join(session_dir, "workspace")
+    now = datetime.now().timestamp()
+    manifest = {
+        "project_path": project_path,
+        "workspace_path": workspace_path,
+        "state": "active",
+        "owner_pid": os.getpid(),
+        "created_at": datetime.now().isoformat(),
+        "expires_at_epoch": now + REVIEW_WORKSPACE_TTL_SECONDS,
+    }
+
+    try:
+        os.makedirs(session_dir, exist_ok=False)
+        _write_text_atomic(
+            os.path.join(session_dir, "manifest.json"),
+            json.dumps(manifest, indent=2),
+        )
+        shutil.copytree(
+            project_path,
+            workspace_path,
+            symlinks=True,
+            ignore=_review_copy_ignore(project_path),
+        )
+        await _initialize_review_workspace_git(workspace_path)
+    except Exception as exc:
+        if os.path.isdir(session_dir):
+            shutil.rmtree(session_dir)
+        return {"status": "FAILURE", "error_output": f"Could not prepare review workspace: {exc}"}
+
+    logger.info(
+        "prepare_code_review_workspace: project=%s workspace=%s",
+        project_path,
+        workspace_path,
+    )
+    return {
+        "status": "SUCCESS",
+        "project_path": project_path,
+        "workspace_path": workspace_path,
+        "expires_in_seconds": REVIEW_WORKSPACE_TTL_SECONDS,
+        "message": (
+            "Edit and compile only this temporary workspace before approval. Generate the "
+            "complete product-source diff here, then pass this path as review_workspace_path "
+            "to request_code_review. Do not copy the proposal into the Android project."
+        ),
+    }
+
+
+# ============================================================
+# TOOL 2: Clean Up an Isolated Code-Review Workspace
+# ============================================================
+@mcp.tool()
+async def cleanup_code_review_workspace(
+    project_path: str,
+    review_workspace_path: str,
+) -> dict:
+    """Remove an MCP-managed proposal workspace without touching product source."""
+    try:
+        project_path = validate_path(project_path, "project_path")
+        _manifest_path, manifest = _load_review_workspace(review_workspace_path)
+        if manifest["project_path"] != project_path:
+            raise ValueError("The review workspace belongs to a different project.")
+        _remove_review_workspace(review_workspace_path)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return {"status": "FAILURE", "error_output": str(exc)}
+
+    logger.info(
+        "cleanup_code_review_workspace: project=%s workspace=%s",
+        project_path,
+        review_workspace_path,
+    )
+    return {
+        "status": "SUCCESS",
+        "removed_workspace": os.path.realpath(review_workspace_path),
+        "message": "The temporary proposal workspace was removed; product source was untouched.",
+    }
+
+
+# ============================================================
+# TOOL 3: Execute Gradle Commands (Whitelisted)
 # ============================================================
 @mcp.tool()
 async def run_gradle(command: str, project_path: str, timeout_seconds: int = 240) -> dict:
-    """Runs a whitelisted gradle command and returns structured success/failure data."""
+    """Run Gradle in an allowed project or MCP-managed review workspace."""
     logger.info(f"run_gradle: command={command}, path={project_path}")
 
     # Validate command against whitelist + patterns
@@ -702,7 +984,7 @@ async def run_gradle(command: str, project_path: str, timeout_seconds: int = 240
         }
 
     try:
-        project_path = validate_path(project_path, "project_path")
+        project_path = _validate_gradle_project_path(project_path)
     except ValueError as e:
         return {"status": "FAILURE", "error_output": str(e)}
 
@@ -1190,16 +1472,28 @@ async def request_code_review(
     project_path: str,
     change_summary: str,
     proposed_diff: str,
+    review_workspace_path: str | None = None,
 ) -> dict:
     """Create a persistent chat checkpoint for an exact product-source diff.
 
-    Call this before making any product-source edit. After it returns, show the
-    proposed_diff verbatim in chat and END THE TURN. Wait for the user's next
-    message. Do not call record_code_review_decision during the same turn.
+    Call this before making any product-source edit. After it returns, show
+    review_markdown verbatim in chat and END THE TURN. Its fenced diff gives
+    added and removed lines distinct colors in compatible chat clients. Wait for
+    the user's next message. Do not call record_code_review_decision during the
+    same turn. Keep proposed_diff unchanged for the later decision/apply calls.
+    When the proposal was prepared in an MCP review workspace, provide its path
+    so that workspace is removed before the review is displayed.
     """
+    review_workspace = None
     try:
         project_path = validate_path(project_path, "project_path")
         changed_files = _validate_review_diff(proposed_diff)
+        if review_workspace_path:
+            _manifest_path, review_workspace = _load_review_workspace(
+                review_workspace_path
+            )
+            if review_workspace["project_path"] != project_path:
+                raise ValueError("The review workspace belongs to a different project.")
     except ValueError as exc:
         return {"status": "FAILURE", "error_output": str(exc)}
 
@@ -1210,6 +1504,17 @@ async def request_code_review(
     review_id, record = _store_pending_review(
         project_path, summary, proposed_diff, changed_files
     )
+    workspace_cleanup_warning = None
+    if review_workspace is not None:
+        try:
+            _remove_review_workspace(review_workspace_path)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            workspace_cleanup_warning = str(exc)
+            logger.warning(
+                "request_code_review: workspace cleanup failed path=%s error=%s",
+                review_workspace_path,
+                exc,
+            )
     logger.info(
         "request_code_review: awaiting chat response project=%s diff=%s files=%s",
         project_path,
@@ -1223,11 +1528,20 @@ async def request_code_review(
         "changed_files": changed_files,
         "change_summary": summary,
         "proposed_diff": proposed_diff,
+        "review_markdown": _format_review_diff_markdown(proposed_diff),
+        "review_workspace_removed": review_workspace is not None
+        and workspace_cleanup_warning is None,
         "expires_in_seconds": PENDING_REVIEW_TTL_SECONDS,
         "message": (
-            "Show change_summary and proposed_diff to the user in chat, ask them to "
-            "reply with approve or requested changes, and END THIS TURN. No source "
-            "change is authorized yet."
+            "Show review_markdown verbatim to the user in chat; do not show the raw "
+            "diff as plain text or remove its diff fence. Then END THIS TURN. Use "
+            "proposed_diff unchanged only for later tool calls. No source change is "
+            "authorized yet."
+        ),
+        **(
+            {"workspace_cleanup_warning": workspace_cleanup_warning}
+            if workspace_cleanup_warning
+            else {}
         ),
     }
 
@@ -3555,8 +3869,10 @@ def _cleanup_stale_allowed_project_sessions() -> None:
 
 
 if __name__ == "__main__":
+    _cleanup_review_workspaces()
     _cleanup_stale_allowed_project_sessions()
     try:
         mcp.run(transport="stdio")
     finally:
         _cleanup_stale_allowed_project_sessions()
+        _cleanup_review_workspaces(owner_pid=os.getpid())

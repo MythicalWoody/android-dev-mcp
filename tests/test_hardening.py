@@ -9,6 +9,14 @@ from unittest import mock
 import server
 
 
+class InstructionTests(unittest.TestCase):
+    def test_uat_debug_is_the_default_integration_variant(self):
+        self.assertIn("always build, install, and test the UAT Debug", server.MCP_INSTRUCTIONS)
+        self.assertIn("unless the user explicitly requests that different", server.MCP_INSTRUCTIONS)
+        self.assertIn("environment in the current chat", server.MCP_INSTRUCTIONS)
+        self.assertIn("never silently substitute another variant", server.MCP_INSTRUCTIONS)
+
+
 class _FakeProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
         self._stdout = stdout
@@ -154,6 +162,109 @@ class MockCleanupTests(unittest.TestCase):
                 self.assertEqual(server._active_mock_projects(), [])
 
 
+class ReviewWorkspaceTests(unittest.IsolatedAsyncioTestCase):
+    SAFE_DIFF = (
+        "diff --git a/app/src/main/Example.kt b/app/src/main/Example.kt\n"
+        "--- a/app/src/main/Example.kt\n"
+        "+++ b/app/src/main/Example.kt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    async def test_managed_workspace_is_outside_project_and_cleanup_isolated(self):
+        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as log_dir:
+            project = os.path.join(allowed_root, "project")
+            source = os.path.join(project, "app", "src", "main", "Example.kt")
+            generated = os.path.join(project, "app", "build", "generated.txt")
+            old_review_copy = os.path.join(project, "android-auto-review-copy", "stale.txt")
+            original_git_marker = os.path.join(project, ".git", "original-only")
+            os.makedirs(os.path.dirname(source), exist_ok=True)
+            os.makedirs(os.path.dirname(generated), exist_ok=True)
+            os.makedirs(os.path.dirname(old_review_copy), exist_ok=True)
+            os.makedirs(os.path.dirname(original_git_marker), exist_ok=True)
+            with open(source, "w") as handle:
+                handle.write("old\n")
+            with open(generated, "w") as handle:
+                handle.write("generated\n")
+            with open(old_review_copy, "w") as handle:
+                handle.write("stale\n")
+            with open(original_git_marker, "w") as handle:
+                handle.write("must not be copied\n")
+
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", allowed_root), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                prepared = await server.prepare_code_review_workspace(project)
+                workspace = prepared["workspace_path"]
+
+                self.assertEqual(prepared["status"], "SUCCESS")
+                self.assertFalse(workspace.startswith(project + os.sep))
+                self.assertEqual(server._validate_gradle_project_path(workspace), workspace)
+                self.assertTrue(os.path.isfile(os.path.join(workspace, "app", "src", "main", "Example.kt")))
+                self.assertFalse(os.path.exists(os.path.join(workspace, "app", "build")))
+                self.assertFalse(os.path.exists(os.path.join(workspace, "android-auto-review-copy")))
+                self.assertTrue(os.path.isdir(os.path.join(workspace, ".git")))
+                self.assertFalse(os.path.exists(os.path.join(workspace, ".git", "original-only")))
+
+                cleaned = await server.cleanup_code_review_workspace(project, workspace)
+
+                self.assertEqual(cleaned["status"], "SUCCESS")
+                self.assertFalse(os.path.exists(workspace))
+                with open(source) as handle:
+                    self.assertEqual(handle.read(), "old\n")
+
+    async def test_request_review_removes_managed_workspace(self):
+        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as log_dir:
+            project = os.path.join(allowed_root, "project")
+            os.makedirs(project)
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", allowed_root), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                prepared = await server.prepare_code_review_workspace(project)
+                workspace = prepared["workspace_path"]
+
+                review = await server.request_code_review(
+                    project,
+                    "Update Example",
+                    self.SAFE_DIFF,
+                    review_workspace_path=workspace,
+                )
+
+                self.assertEqual(review["status"], "AWAITING_USER_REVIEW")
+                self.assertTrue(review["review_workspace_removed"])
+                self.assertFalse(os.path.exists(workspace))
+
+    def test_unregistered_temp_copy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as log_dir, tempfile.TemporaryDirectory() as arbitrary_copy:
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", allowed_root), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                with self.assertRaisesRegex(ValueError, "outside allowed root"):
+                    server._validate_gradle_project_path(arbitrary_copy)
+
+    async def test_expired_workspace_is_removed(self):
+        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as log_dir:
+            project = os.path.join(allowed_root, "project")
+            os.makedirs(project)
+            with mock.patch.object(server, "ALLOWED_PROJECT_ROOT", allowed_root), mock.patch.object(
+                server, "LOG_DIR", log_dir
+            ):
+                prepared = await server.prepare_code_review_workspace(project)
+                workspace = prepared["workspace_path"]
+                manifest_path = server._review_workspace_manifest_path(workspace)
+                with open(manifest_path) as handle:
+                    manifest = json.load(handle)
+                manifest["expires_at_epoch"] = 0
+                with open(manifest_path, "w") as handle:
+                    json.dump(manifest, handle)
+
+                removed = server._cleanup_review_workspaces()
+
+                self.assertEqual(removed, [workspace])
+                self.assertFalse(os.path.exists(workspace))
+
+
 class CodeReviewGateTests(unittest.IsolatedAsyncioTestCase):
     SAFE_DIFF = (
         "diff --git a/app/src/main/Example.kt b/app/src/main/Example.kt\n"
@@ -176,6 +287,9 @@ class CodeReviewGateTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(review["status"], "AWAITING_USER_REVIEW")
                 self.assertEqual(review["proposed_diff"], self.SAFE_DIFF)
+                self.assertIn("```diff\n", review["review_markdown"])
+                self.assertIn("\n-old\n+new\n```", review["review_markdown"])
+                self.assertIn("Reply with **approve**", review["review_markdown"])
                 self.assertNotIn("approval_token", review)
 
                 premature = await server.record_code_review_decision(
@@ -217,6 +331,15 @@ class CodeReviewGateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(git_apply.await_count, 2)
                 self.assertEqual(reused["status"], "FAILURE")
                 self.assertIn("consumed", reused["error_output"])
+
+    def test_review_markdown_uses_a_safe_fence(self):
+        proposed_diff = self.SAFE_DIFF.replace("+new", "+`````new`````")
+
+        review_markdown = server._format_review_diff_markdown(proposed_diff)
+
+        self.assertIn("``````diff\n", review_markdown)
+        self.assertIn(proposed_diff, review_markdown)
+        self.assertIn("\n``````\n", review_markdown)
 
     async def test_change_request_closes_review_without_approval(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as log_dir:

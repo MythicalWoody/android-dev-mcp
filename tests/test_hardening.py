@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-import server
+from android_autodev import runtime as server
 
 
 class InstructionTests(unittest.TestCase):
@@ -15,6 +15,12 @@ class InstructionTests(unittest.TestCase):
         self.assertIn("unless the user explicitly requests that different", server.MCP_INSTRUCTIONS)
         self.assertIn("environment in the current chat", server.MCP_INSTRUCTIONS)
         self.assertIn("never silently substitute another variant", server.MCP_INSTRUCTIONS)
+
+    def test_generated_code_requires_useful_explanatory_comments(self):
+        self.assertIn("Whenever adding or altering code, always add or update", server.MCP_INSTRUCTIONS)
+        self.assertIn("Every added or materially changed class", server.MCP_INSTRUCTIONS)
+        self.assertIn("must explain why the logic exists", server.MCP_INSTRUCTIONS)
+        self.assertIn("Avoid noisy", server.MCP_INSTRUCTIONS)
 
 
 class _FakeProcess:
@@ -312,8 +318,9 @@ class CodeReviewGateTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(decision["status"], "APPROVED")
 
-                with mock.patch(
-                    "server._git_apply",
+                with mock.patch.object(
+                    server,
+                    "_git_apply",
                     new=mock.AsyncMock(return_value=(0, "")),
                 ) as git_apply:
                     applied = await server.apply_reviewed_patch(

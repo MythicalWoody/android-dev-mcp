@@ -1,14 +1,21 @@
 [project]
 name = "android-dev-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Review-gated Android build, device, Appium, mock API, and visual verification MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "Appium-Python-Client>=2,<6",
-    "httpx",
-    "mcp[cli]",
-    "Pillow",
+    "httpx>=0.27,<1",
+    "mcp[cli]>=1.9,<2",
+    "Pillow>=10,<13",
     "pytest>=7,<10",
     "pytest-json-report>=1.5,<2",
 ]
+
+[project.scripts]
+android-autodev = "android_autodev.app:run"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -4,10 +4,9 @@
       "command": "uv",
       "args": [
         "run",
-        "--directory",
-        "/Users/shivamsingh/android-dev-testing-mcp",
-        "python",
-        "server.py"
+        "--project",
+        ".",
+        "android-autodev"
       ],
       "disabled": false,
       "autoApprove": []

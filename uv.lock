@@ -26,9 +26,9 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "appium-python-client", specifier = ">=2,<6" },
-    { name = "httpx" },
-    { name = "mcp", extras = ["cli"] },
-    { name = "pillow" },
+    { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.9,<2" },
+    { name = "pillow", specifier = ">=10,<13" },
     { name = "pytest", specifier = ">=7,<10" },
     { name = "pytest-json-report", specifier = ">=1.5,<2" },
 ]

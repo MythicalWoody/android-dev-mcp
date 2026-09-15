@@ -1,10 +1,16 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.pytest_cache/
+.coverage
 build/
 dist/
 wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+
+# Local Android AutoDev state and generated test artifacts
+.android-autodev-state/
+test-artifacts/

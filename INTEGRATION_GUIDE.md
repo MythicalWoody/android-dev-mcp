@@ -205,9 +205,9 @@ Package: com.example.myapp
 
 ### What the Agent Does Automatically
 
-1. Reads `requirements.md` and `design.md`
-2. Asks whether to use the deployed real API or temporary mock responses
-3. Uses UAT Debug for routine integration testing unless you explicitly request another environment
+1. Runs `doctor` and `inspect_android_project`, then starts an isolated workflow
+2. Reads `requirements.md` and `design.md`
+3. Asks whether to use the deployed real API or temporary mock responses and records the choice against that workflow
 4. Creates an MCP-managed temporary review workspace outside the Android project
 5. Prepares and compiles the proposed changes only in that temporary workspace
 6. Submits the complete unified diff and removes the temporary workspace
@@ -219,11 +219,11 @@ Package: com.example.myapp
 12. Resolves the actual connected ADB device (physical, network, or emulator)
 13. Generates and runs the Appium E2E test against that resolved serial
 14. On failure: captures UI state, prepares a revised diff, and requests a new review
-15. Performs final cleanup and verifies that no temporary mock wiring remains
+15. Performs ownership-aware final cleanup and verifies that no temporary mock wiring remains
 
 The pending chat review persists for 24 hours. It does not authorize any source
 change. After your next chat message approves the proposal, the MCP issues an
-approval token bound to the exact project and diff; that token expires after 30
+approval token bound to the exact project, diff, and Git worktree fingerprint; that token expires after 30
 minutes and works once. Any change to the diff requires a new chat review.
 
 UAT Debug is the default environment for day-to-day integration work. The agent
@@ -231,6 +231,16 @@ must not substitute Development, Staging, Production, Release, or another build
 variant unless you explicitly request it in the current chat. If UAT Debug does
 not exist in the project, the agent must stop and ask. Explicitly choosing mock
 API mode authorizes that workflow's Mock Debug variant.
+Any other variant additionally requires a one-time token from
+`authorize_environment`. The restriction is checked by `run_gradle`, rather
+than depending only on prompt instructions.
+
+Whenever code is added or altered, its explanatory comments or documentation
+must also be added or updated. Every generated or materially changed class and
+non-trivial function explains its responsibility. Non-obvious business rules,
+lifecycle behavior, safety constraints, and architectural decisions explain why
+the logic exists. A change is incomplete when those comments are missing or
+stale; comments that only repeat obvious syntax are avoided.
 
 ### The agent halts when:
 - All gates pass (success), OR
@@ -242,19 +252,27 @@ API mode authorizes that workflow's Mock Debug variant.
 
 | Tool | Purpose |
 |------|---------|
-| `prepare_code_review_workspace(project_path)` | Create an isolated MCP-managed project copy under the temporary log area for pre-approval editing and compilation |
+| `start_workflow(project_path, purpose)` | Create isolated state and project/resource leases for one task |
+| `get_workflow_status(...)` / `cancel_workflow(...)` | Resume, inspect, or safely abandon a workflow |
+| `doctor(project_path?)` | Validate Java, SDK, adb, Appium, Node, Figma, and project prerequisites |
+| `inspect_android_project(project_path, save_profile?)` | Discover modules, Gradle DSL, flavors, IDs, activity, and integration libraries |
+| `prepare_code_review_workspace(project_path, include_untracked_paths?)` | Create a private, quota-limited snapshot from tracked and explicitly selected files |
 | `cleanup_code_review_workspace(project_path, review_workspace_path)` | Remove a managed proposal workspace without touching the Android project |
 | `request_code_review(project_path, change_summary, proposed_diff, review_workspace_path?)` | Persist the proposed diff, clean its managed workspace, return a syntax-highlighted Markdown `diff` block, and require the AI to end its turn |
-| `record_code_review_decision(project_path, review_id, proposed_diff, decision, user_response, user_confirmed?)` | Resume on the user's next message; issue an apply token only for explicit approval |
+| `list_pending_code_reviews(...)` / `get_code_review(...)` / `cancel_code_review(...)` | Recover or close reviews after chat context loss |
+| `record_code_review_decision(project_path, review_id, proposed_diff?, decision, user_response, user_confirmed?)` | Resume on the user's next message; issue an apply token only for explicit approval |
 | `apply_reviewed_patch(project_path, proposed_diff, approval_token)` | Validate and apply the exact approved diff; rejects altered, expired, unsafe, or reused approvals |
-| `run_gradle(command, project_path, timeout_seconds?)` | Run whitelisted Gradle commands; timed-out process trees are terminated |
-| `generate_mock_interceptor(spec_path, package_name, output_dir)` | Generate OkHttp interceptor from spec |
-| `run_appium_test(test_script_path)` | Simple Appium test execution |
-| `run_appium_e2e(test_script_path, project_path, device_serial?)` | Full E2E orchestration on a resolved ADB device |
-| `capture_ui_state(output_dir, device_serial?)` | Screenshot + XML dump from the selected device |
+| `authorize_environment(...)` | Issue one exact, one-time non-UAT variant authorization after explicit confirmation |
+| `run_gradle(..., workflow_id, environment_authorization_token?)` | Enforce UAT/Mock policy and run one bounded Gradle task with combined diagnostics |
+| `run_quality_gate(project_path, workflow_id)` | Run the standard UAT Debug lint, unit-test, and build sequence |
+| `generate_mock_interceptor(..., workflow_id)` | Generate escaped OkHttp source inside the workflow's discovered mock source set |
+| `run_appium_test(..., workflow_id)` | Run against the leased device and workflow-owned dynamic Appium port |
+| `run_appium_e2e(..., workflow_id)` | Full E2E orchestration with isolated reports and fail-closed result parsing |
+| `capture_ui_state(..., workflow_id)` | Screenshot + XML dump from the leased device; Base64 is opt-in |
 | `capture_and_verify_ui(output_dir, spec_requirement)` | Capture + verification context |
-| `verify_emulator_ready(device_serial?)` | Resolve and verify a physical or emulated Android device |
-| `cleanup_test_environment(project_path, package_name, device_serial?, final_cleanup?)` | Teardown between runs and optional final mock cleanup |
+| `verify_emulator_ready(..., workflow_id)` | Resolve, verify, and lease a physical or emulated Android device |
+| `cleanup_test_environment(..., workflow_id, clear_app_data?, user_confirmed_data_clear?)` | Preserve app data by default and remove only workflow-owned resources |
+| `collect_failure_bundle(...)` | Collect workflow, logcat, device, and package diagnostics |
 | `verify_no_temporary_mock_wiring(project_path)` | Final audit for MCP-generated mock wiring |
 
 ---
@@ -272,7 +290,7 @@ API mode authorizes that workflow's Mock Debug variant.
 | Temporary proposal files appear in the Android project | Use `prepare_code_review_workspace`; never create `.android-auto-review` or `android-auto-review-copy` inside the project |
 | Device timeout | Check `adb devices`; pass `device_serial` when multiple devices are online |
 | Appium not found | Install globally: `npm install -g appium` |
-| E2E flaky failures | Agent calls `cleanup_test_environment` between retries automatically |
+| E2E flaky failures | Inspect `collect_failure_bundle`; cleanup preserves app state and never kills an external Appium process |
 
 ---
 
@@ -294,9 +312,8 @@ AndroidAutoDev-generated `mockDebug` files are temporary. Do not commit them. Fi
 
 ## Logs
 
-All tool executions are logged to:
-```
-/tmp/kiro-android-autodev/agent.log
-```
+Tool executions use rotating logs below `ANDROID_AUTODEV_STATE_DIR`. When the
+variable is unset, the server uses the platform temporary directory under
+`android-autodev/agent.log`.
 
 Check this file for debugging failed runs or understanding the agent's decision path.

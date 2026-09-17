@@ -6,11 +6,6 @@ Figma visual comparison.
 
 ## Development status
 
-`main` contains the stable review-gated workflow described below. Tier 1 safety
-gates are implemented and documented on
-[`codex/tier1-safety-gates`](https://github.com/MythicalWoody/android-dev-mcp/tree/codex/tier1-safety-gates),
-but they are not active on `main` until that branch is merged.
-
 The feature branch adds:
 
 - redacted regex and entropy-based secret scanning before review and again

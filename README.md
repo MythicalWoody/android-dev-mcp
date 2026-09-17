@@ -4,6 +4,27 @@ Android AutoDev is a local MCP server for review-gated Android changes, UAT
 Debug builds, API mocks, device/Appium automation, failure diagnostics, and
 Figma visual comparison.
 
+## Development status
+
+`main` contains the stable review-gated workflow described below. Tier 1 safety
+gates are implemented and documented on
+[`codex/tier1-safety-gates`](https://github.com/MythicalWoody/android-dev-mcp/tree/codex/tier1-safety-gates),
+but they are not active on `main` until that branch is merged.
+
+The feature branch adds:
+
+- redacted regex and entropy-based secret scanning before review and again
+  immediately before an approved patch is applied;
+- an exact-workspace dependency gate that resolves the UAT Debug Maven graph
+  and checks it with OSV before dependency changes can be reviewed;
+- mandatory Detekt and ktlint execution in `run_quality_gate`, followed by the
+  existing UAT Debug lint, unit-test, and build tasks;
+- project diagnostics, failure codes, explanatory documentation, and regression
+  coverage for all three gates.
+
+Review the complete branch difference or open a pull request from the
+[`main...codex/tier1-safety-gates` comparison](https://github.com/MythicalWoody/android-dev-mcp/compare/main...codex/tier1-safety-gates).
+
 ## Safety model
 
 - Every integration run starts with `start_workflow`; project, device, retry,
@@ -87,5 +108,6 @@ Pending reviews can be recovered with `list_pending_code_reviews` and
 uv run python -m pytest -q
 ```
 
-CI and broader security/integration test expansion are intentionally not part of
-the current implementation scope.
+The Tier 1 feature branch includes the additional security-gate regression tests;
+the baseline command above runs the tests available on whichever branch is
+currently checked out.

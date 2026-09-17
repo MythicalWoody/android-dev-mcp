@@ -210,16 +210,19 @@ Package: com.example.myapp
 3. Asks whether to use the deployed real API or temporary mock responses and records the choice against that workflow
 4. Creates an MCP-managed temporary review workspace outside the Android project
 5. Prepares and compiles the proposed changes only in that temporary workspace
-6. Submits the complete unified diff and removes the temporary workspace
-7. Posts the highlighted proposed diff in chat and ends the turn
-8. Waits for your next message to approve, reject, or request changes
-9. Resumes only after recording that next-message decision
-10. Generates and activates mock wiring only when mock mode was explicitly selected
-11. Builds and tests the authorized variant
-12. Resolves the actual connected ADB device (physical, network, or emulator)
-13. Generates and runs the Appium E2E test against that resolved serial
-14. On failure: captures UI state, prepares a revised diff, and requests a new review
-15. Performs ownership-aware final cleanup and verifies that no temporary mock wiring remains
+6. Scans added lines for secrets; dependency changes also resolve the exact UAT
+   Debug graph in that workspace and query OSV
+7. Submits the complete safe unified diff and removes the temporary workspace
+8. Posts the highlighted proposed diff in chat and ends the turn
+9. Waits for your next message to approve, reject, or request changes
+10. Resumes only after recording that next-message decision
+11. Generates and activates mock wiring only when mock mode was explicitly selected
+12. Re-scans the exact diff for secrets immediately before applying it
+13. Runs the OSV dependency gate, Detekt, ktlint, lint, unit tests, and the UAT Debug build
+14. Resolves the actual connected ADB device (physical, network, or emulator)
+15. Generates and runs the Appium E2E test against that resolved serial
+16. On failure: captures UI state, prepares a revised diff, and requests a new review
+17. Performs ownership-aware final cleanup and verifies that no temporary mock wiring remains
 
 The pending chat review persists for 24 hours. It does not authorize any source
 change. After your next chat message approves the proposal, the MCP issues an
@@ -254,17 +257,19 @@ stale; comments that only repeat obvious syntax are avoided.
 |------|---------|
 | `start_workflow(project_path, purpose)` | Create isolated state and project/resource leases for one task |
 | `get_workflow_status(...)` / `cancel_workflow(...)` | Resume, inspect, or safely abandon a workflow |
-| `doctor(project_path?)` | Validate Java, SDK, adb, Appium, Node, Figma, and project prerequisites |
+| `doctor(project_path?)` | Validate Java, SDK, adb, Appium, Node, Figma, Detekt, ktlint, and project prerequisites |
 | `inspect_android_project(project_path, save_profile?)` | Discover modules, Gradle DSL, flavors, IDs, activity, and integration libraries |
 | `prepare_code_review_workspace(project_path, include_untracked_paths?)` | Create a private, quota-limited snapshot from tracked and explicitly selected files |
 | `cleanup_code_review_workspace(project_path, review_workspace_path)` | Remove a managed proposal workspace without touching the Android project |
-| `request_code_review(project_path, change_summary, proposed_diff, review_workspace_path?)` | Persist the proposed diff, clean its managed workspace, return a syntax-highlighted Markdown `diff` block, and require the AI to end its turn |
+| `request_code_review(project_path, change_summary, proposed_diff, review_workspace_path?, workflow_id?)` | Secret-scan the diff; require an exact managed-workspace OSV scan for dependency changes; persist and highlight only a safe proposal |
 | `list_pending_code_reviews(...)` / `get_code_review(...)` / `cancel_code_review(...)` | Recover or close reviews after chat context loss |
 | `record_code_review_decision(project_path, review_id, proposed_diff?, decision, user_response, user_confirmed?)` | Resume on the user's next message; issue an apply token only for explicit approval |
 | `apply_reviewed_patch(project_path, proposed_diff, approval_token)` | Validate and apply the exact approved diff; rejects altered, expired, unsafe, or reused approvals |
 | `authorize_environment(...)` | Issue one exact, one-time non-UAT variant authorization after explicit confirmation |
 | `run_gradle(..., workflow_id, environment_authorization_token?)` | Enforce UAT/Mock policy and run one bounded Gradle task with combined diagnostics |
-| `run_quality_gate(project_path, workflow_id)` | Run the standard UAT Debug lint, unit-test, and build sequence |
+| `scan_dependency_vulnerabilities(project_path, workflow_id)` | Resolve the UAT Debug Maven graph and fail closed on OSV findings or an incomplete scan |
+| `run_static_analysis(project_path, workflow_id)` | Require and run project-provided Detekt and ktlint tasks |
+| `run_quality_gate(project_path, workflow_id)` | Run dependency, Detekt, ktlint, UAT Debug lint, unit-test, and build gates |
 | `generate_mock_interceptor(..., workflow_id)` | Generate escaped OkHttp source inside the workflow's discovered mock source set |
 | `run_appium_test(..., workflow_id)` | Run against the leased device and workflow-owned dynamic Appium port |
 | `run_appium_e2e(..., workflow_id)` | Full E2E orchestration with isolated reports and fail-closed result parsing |
@@ -282,6 +287,9 @@ stale; comments that only repeat obvious syntax are avoided.
 | Problem | Solution |
 |---------|----------|
 | "Gradle command not whitelisted" | Only commands in the allow-list work. Check steering rules for the full list. |
+| `DEPENDENCY_REVIEW_WORKSPACE_REQUIRED` | Prepare the dependency edit in `prepare_code_review_workspace`, pass its exact Git diff and `workflow_id`, then request review again. |
+| `DEPENDENCY_SCAN_INCOMPLETE` | Restore Gradle/OSV connectivity and rerun; incomplete vulnerability checks fail closed. |
+| `STATIC_ANALYSIS_NOT_CONFIGURED` | Configure both Detekt and ktlint Gradle plugins/tasks before running the quality gate. |
 | "Path outside allowed root" | Set `ANDROID_PROJECT_ROOT` env var to cover your project path |
 | "No module named 'mcp'" | Run `uv sync` in the MCP server directory |
 | `NEEDS_USER_DECISION` | End the current turn and wait for the user's next chat message before recording a decision |

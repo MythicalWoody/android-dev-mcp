@@ -7,7 +7,7 @@ import importlib.metadata
 import os
 import shutil
 
-from .. import project as project_service
+from .. import project as project_service, static_analysis
 from .. import runtime
 from ._registration import register_tools
 
@@ -103,6 +103,10 @@ async def doctor(project_path: str = "") -> dict:
         "required": False,
         "message": "Optional when Figma references are supplied through another MCP connector.",
     }
+    checks["secret_scanner"] = {
+        "available": True,
+        "message": "Built-in redacted regex and entropy scanning is active at review and apply time.",
+    }
 
     project_profile = None
     if project_path:
@@ -114,6 +118,19 @@ async def doctor(project_path: str = "") -> dict:
         checks["gradle_wrapper"] = {
             "available": os.path.isfile(os.path.join(project, "gradlew")),
             "path": os.path.join(project, "gradlew"),
+        }
+        analyzers = await asyncio.to_thread(static_analysis.configured_plugins, project)
+        checks["detekt"] = {
+            "available": analyzers["detekt"],
+            "message": "Detekt must expose a Gradle task for run_quality_gate.",
+        }
+        checks["ktlint"] = {
+            "available": analyzers["ktlint"],
+            "message": "ktlint must expose a Gradle task for run_quality_gate.",
+        }
+        checks["osv_dependency_scan"] = {
+            "available": True,
+            "message": "OSV reachability is verified when the dependency scan runs.",
         }
 
     missing = [

@@ -9,7 +9,7 @@ class ProjectStructureTests(unittest.TestCase):
         grouped_tools = [tool for module in TOOL_MODULES for tool in module.TOOLS]
         grouped_names = [tool.__name__ for tool in grouped_tools]
 
-        self.assertEqual(len(grouped_names), 36)
+        self.assertEqual(len(grouped_names), 38)
         self.assertEqual(len(grouped_names), len(set(grouped_names)))
         self.assertEqual(set(grouped_names), set(server.mcp._tool_manager._tools))
 

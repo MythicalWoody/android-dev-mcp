@@ -16,7 +16,15 @@ from mcp.server.fastmcp import FastMCP
 from PIL import Image
 import httpx
 
-from . import e2e_generation, mocking, review_workspace, visual, workflows
+from . import (
+    dependency_scanning,
+    e2e_generation,
+    mocking,
+    review_workspace,
+    security_scanning,
+    visual,
+    workflows,
+)
 from .security import (
     atomic_write_text,
     file_lock,
@@ -56,6 +64,10 @@ token or alter the diff after approval. If the user rejects or requests changes,
 prepare a revised diff and repeat the chat-review checkpoint. Temporary
 MCP-owned mock wiring, generated test artifacts, build outputs, and cleanup
 operations are outside this product-source gate.
+Every review diff is scanned for secrets before it can be shown and again before
+it can be applied. Dependency-file changes must be prepared in the managed
+review workspace and must pass the UAT Debug OSV dependency scan before the
+review checkpoint. Never bypass, suppress, or fabricate either scan result.
 If chat context no longer contains the review, use list_pending_code_reviews and
 get_code_review to recover the exact persisted patch; never reconstruct it from
 memory. Approval is invalid if the project fingerprint changes.
@@ -76,6 +88,9 @@ and ask the user; never silently substitute another variant. An explicit mock AP
 selection authorizes the corresponding Mock Debug variant for that workflow.
 For any other variant, call authorize_environment after that explicit request
 and pass its one-time token to run_gradle. Runtime validation enforces this rule.
+Before final delivery, run run_quality_gate. Treat an incomplete OSV lookup,
+reported vulnerable dependency, missing Detekt/ktlint task, or analyzer failure
+as a blocking result; never skip or reinterpret these checks as warnings.
 
 Whenever adding or altering code, always add or update concise explanatory
 comments or documentation. Every added or materially changed class and
@@ -200,6 +215,10 @@ ALLOWED_GRADLE_COMMANDS = {
     "connectedUatDebugAndroidTest",
     "installMockDebug",
     "installUatDebug",
+    "detekt",
+    "detektUatDebug",
+    "ktlintCheck",
+    "ktlintUatDebugCheck",
 }
 
 # Regex patterns define safe task syntax. run_gradle separately enforces UAT,
@@ -215,6 +234,8 @@ ALLOWED_GRADLE_PATTERNS = [
     _re.compile(r"^compile[A-Z]\w*Sources$"),      # compileDevelopmentDebugSources, etc.
     _re.compile(r"^merge[A-Z]\w*Resources$"),      # mergeDevelopmentDebugResources, etc.
     _re.compile(r"^package[A-Z]\w*$"),             # packageProductionRelease, etc.
+    _re.compile(r"^detekt(?:[A-Z]\w*)?$"),         # detekt, detektUatDebug, etc.
+    _re.compile(r"^ktlint(?:[A-Z]\w*)?Check$"),    # ktlintCheck, ktlintUatDebugCheck, etc.
 ]
 
 # Explicitly blocked commands (dangerous operations)
@@ -261,7 +282,7 @@ def _is_gradle_command_allowed(command: str) -> bool:
 def _gradle_task_variant(command: str) -> str | None:
     """Extract the build variant governed by the UAT-only runtime policy."""
     task = _gradle_task_leaf(command)
-    if task in {"clean", "lint"}:
+    if task in {"clean", "lint", "detekt", "ktlintCheck"} or task.startswith(("detekt", "ktlint")):
         return None
     patterns = (
         r"^(?:assemble|install|bundle|package|lint)([A-Z]\w*)$",
@@ -595,7 +616,9 @@ def _store_code_review(
     change_summary: str,
     proposed_diff: str,
     base_fingerprint: str = "",
+    safety_checks: dict | None = None,
 ) -> tuple[str, dict]:
+    """Persist one approved patch together with the checks that guarded it."""
     token = secrets.token_urlsafe(32)
     now = datetime.now().timestamp()
     record = {
@@ -607,6 +630,7 @@ def _store_code_review(
         "state": "approved",
         "approved_at": datetime.now().isoformat(),
         "expires_at_epoch": now + CODE_REVIEW_TTL_SECONDS,
+        "safety_checks": safety_checks or {},
     }
     record_path = _code_review_record_path(project_path, token)
     private_makedirs(os.path.dirname(record_path))
@@ -619,7 +643,9 @@ def _store_pending_review(
     change_summary: str,
     proposed_diff: str,
     changed_files: list[str],
+    safety_checks: dict | None = None,
 ) -> tuple[str, dict]:
+    """Persist an exact review proposal and its completed safety evidence."""
     review_id = secrets.token_urlsafe(24)
     now = datetime.now().timestamp()
     record = {
@@ -633,6 +659,7 @@ def _store_pending_review(
         "state": "awaiting_user_review",
         "created_at": datetime.now().isoformat(),
         "expires_at_epoch": now + PENDING_REVIEW_TTL_SECONDS,
+        "safety_checks": safety_checks or {},
     }
     record_path = _pending_review_record_path(project_path, review_id)
     private_makedirs(os.path.dirname(record_path))
@@ -725,6 +752,44 @@ async def _git_apply(project_path: str, proposed_diff: str, check_only: bool) ->
     stdout, stderr = await process.communicate(proposed_diff.encode("utf-8"))
     output = (stdout + stderr).decode(errors="replace").strip()
     return process.returncode, output
+
+
+async def _review_workspace_diff(workspace_path: str) -> str:
+    """Return the complete workspace diff, including newly created text files."""
+    # Intent-to-add makes untracked proposal files visible to `git diff HEAD`
+    # without staging their content or affecting the real Android project.
+    add_process = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        workspace_path,
+        "add",
+        "--intent-to-add",
+        "--all",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await add_process.communicate()
+    if add_process.returncode != 0:
+        raise RuntimeError(
+            f"Could not enumerate review workspace changes: {(stdout + stderr).decode(errors='replace').strip()}"
+        )
+    diff_process = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        workspace_path,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "HEAD",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await diff_process.communicate()
+    if diff_process.returncode != 0:
+        raise RuntimeError(
+            f"Could not read review workspace changes: {(stdout + stderr).decode(errors='replace').strip()}"
+        )
+    return stdout.decode("utf-8", errors="strict")
 
 
 # --- Temporary mock integration lifecycle ---
@@ -1708,6 +1773,7 @@ async def request_code_review(
     change_summary: str,
     proposed_diff: str,
     review_workspace_path: str | None = None,
+    workflow_id: str = "",
 ) -> dict:
     """Create a persistent chat checkpoint for an exact product-source diff.
 
@@ -1717,12 +1783,16 @@ async def request_code_review(
     the user's next message. Do not call record_code_review_decision during the
     same turn. Keep proposed_diff unchanged for the later decision/apply calls.
     When the proposal was prepared in an MCP review workspace, provide its path
-    so that workspace is removed before the review is displayed.
+    so that workspace is removed before the review is displayed. Dependency
+    changes require that workspace plus an active workflow because their exact
+    resolved UAT dependency graph must pass OSV before review.
     """
     review_workspace = None
+    safety_checks: dict = {"secret_scan": {"status": "SUCCESS", "findings": 0}}
     try:
         project_path = validate_path(project_path, "project_path")
         changed_files = _validate_review_diff(proposed_diff)
+        security_scanning.require_clean_diff(proposed_diff)
         if review_workspace_path:
             _manifest_path, review_workspace = _load_review_workspace(
                 review_workspace_path
@@ -1730,14 +1800,57 @@ async def request_code_review(
             if review_workspace["project_path"] != project_path:
                 raise ValueError("The review workspace belongs to a different project.")
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return {"status": "FAILURE", "error_output": str(exc)}
+        return {
+            "status": "FAILURE",
+            "error_code": "REVIEW_SAFETY_CHECK_FAILED",
+            "error_output": str(exc),
+        }
 
     summary = (change_summary or "").strip()
     if not summary:
         return {"status": "FAILURE", "error_output": "change_summary is required."}
 
+    if dependency_scanning.affects_dependencies(changed_files):
+        if review_workspace is None:
+            return {
+                "status": "FAILURE",
+                "error_code": "DEPENDENCY_REVIEW_WORKSPACE_REQUIRED",
+                "error_output": (
+                    "Dependency changes must be prepared in an MCP-managed review workspace "
+                    "so the exact proposed graph can be scanned before review."
+                ),
+            }
+        try:
+            workflows.load_workflow(LOG_DIR, workflow_id, project_path)
+            workspace_diff = await _review_workspace_diff(review_workspace_path)
+            if not secrets.compare_digest(
+                hashlib.sha256(workspace_diff.encode("utf-8")).hexdigest(),
+                hashlib.sha256(proposed_diff.encode("utf-8")).hexdigest(),
+            ):
+                raise ValueError(
+                    "The supplied diff does not exactly match the managed review workspace. "
+                    "Regenerate the diff from that workspace before scanning."
+                )
+            dependency_result = await dependency_scanning.scan_gradle_project(
+                review_workspace_path
+            )
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            return {
+                "status": "FAILURE",
+                "error_code": "DEPENDENCY_SCAN_INCOMPLETE",
+                "error_output": str(exc),
+            }
+        if dependency_result.get("status") != "SUCCESS":
+            return dependency_result
+        safety_checks["dependency_scan"] = dependency_result
+    else:
+        safety_checks["dependency_scan"] = {
+            "status": "NOT_REQUIRED",
+            "reason": "The diff does not change dependency configuration.",
+        }
+
     review_id, record = _store_pending_review(
-        project_path, summary, proposed_diff, changed_files
+        project_path, summary, proposed_diff, changed_files, safety_checks
     )
     workspace_cleanup_warning = None
     if review_workspace is not None:
@@ -1766,6 +1879,7 @@ async def request_code_review(
         "review_markdown": _format_review_diff_markdown(proposed_diff),
         "review_workspace_removed": review_workspace is not None
         and workspace_cleanup_warning is None,
+        "safety_checks": safety_checks,
         "expires_in_seconds": PENDING_REVIEW_TTL_SECONDS,
         "message": (
             "Show review_markdown verbatim to the user in chat; do not show the raw "
@@ -1846,6 +1960,7 @@ async def record_code_review_decision(
                 record["change_summary"],
                 proposed_diff,
                 record["base_fingerprint"],
+                record.get("safety_checks", {}),
             )
         except OSError as exc:
             _set_code_review_state(record_path, record, "awaiting_user_review")
@@ -1860,6 +1975,7 @@ async def record_code_review_decision(
             "status": "APPROVED",
             "approval_token": approval_token,
             "diff_sha256": approval["diff_sha256"],
+            "safety_checks": approval.get("safety_checks", {}),
             "expires_in_seconds": CODE_REVIEW_TTL_SECONDS,
             "message": "Resume the workflow and apply this exact diff once.",
         }
@@ -1943,6 +2059,7 @@ async def get_code_review(project_path: str, review_id: str) -> dict:
         "changed_files": record.get("changed_files", []),
         "proposed_diff": proposed_diff,
         "review_markdown": _format_review_diff_markdown(proposed_diff),
+        "safety_checks": record.get("safety_checks", {}),
     }
 
 
@@ -1987,6 +2104,9 @@ async def apply_reviewed_patch(
             with open(approval_path, "r") as handle:
                 proposed_diff = str(json.load(handle).get("proposed_diff", ""))
         changed_files = _validate_review_diff(proposed_diff)
+        # Scan again at the mutation boundary so persisted approvals cannot
+        # become a path around newly strengthened secret-detection rules.
+        security_scanning.require_clean_diff(proposed_diff)
         record_path, record = _authorize_reviewed_diff(
             project_path, proposed_diff, approval_token
         )
@@ -2026,6 +2146,7 @@ async def apply_reviewed_patch(
         "status": "SUCCESS",
         "changed_files": changed_files,
         "diff_sha256": record["diff_sha256"],
+        "safety_checks": record.get("safety_checks", {}),
         "message": "The exact manually reviewed diff was applied; its token is now consumed.",
     }
 

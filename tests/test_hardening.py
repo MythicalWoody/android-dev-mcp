@@ -22,6 +22,12 @@ class InstructionTests(unittest.TestCase):
         self.assertIn("must explain why the logic exists", server.MCP_INSTRUCTIONS)
         self.assertIn("Avoid noisy", server.MCP_INSTRUCTIONS)
 
+    def test_security_and_static_analysis_gates_cannot_be_downgraded(self):
+        self.assertIn("Every review diff is scanned for secrets", server.MCP_INSTRUCTIONS)
+        self.assertIn("must pass the UAT Debug OSV dependency scan", server.MCP_INSTRUCTIONS)
+        self.assertIn("missing Detekt/ktlint task", server.MCP_INSTRUCTIONS)
+        self.assertIn("never skip or reinterpret these checks as warnings", server.MCP_INSTRUCTIONS)
+
 
 class _FakeProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):

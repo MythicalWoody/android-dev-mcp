@@ -14,6 +14,13 @@ Figma visual comparison.
 - Product changes use a persisted unified diff, highlighted chat review, and a
   one-time approval token. Approvals are bound to the diff and Git worktree
   fingerprint, and can be listed or resumed after context loss.
+- Added diff lines are scanned for known credential formats and high-entropy
+  values before review and again immediately before apply. Findings are always
+  redacted. Dependency-file diffs must pass an OSV scan of the exact managed
+  review workspace before they can be shown for approval.
+- `run_quality_gate` fails closed unless the resolved UAT Debug dependency graph
+  is vulnerability-free and both project-provided Detekt and ktlint tasks pass.
+  Only Maven package coordinates and versions—not project source—are sent to OSV.
 - Generated paths and source identifiers are validated. Appium tests interpret
   a small data-only action vocabulary and fail on unsupported or missing checks.
 - Every code addition or alteration must add or update accurate explanatory
@@ -33,6 +40,9 @@ android_autodev/
 ├── app.py                 # MCP composition and lifecycle
 ├── runtime.py             # Backward-compatible tool facade and legacy parsers
 ├── security.py            # Path, identifier, escaping, permissions, and locks
+├── security_scanning.py   # Redacted regex and entropy scanning for review diffs
+├── dependency_scanning.py # Resolved Gradle graph and OSV vulnerability checks
+├── static_analysis.py     # Detekt/ktlint task discovery
 ├── workflows.py           # Durable workflow state, leases, and environment tokens
 ├── project.py             # Android project discovery and TOML profiles
 ├── mocking.py             # Groovy/KTS and OkHttp mock integration planning
@@ -69,11 +79,13 @@ is created with owner-only permissions. Logs rotate automatically.
 2. Call `start_workflow(project_path, purpose)`.
 3. Ask for real or mock API mode and record it with `select_api_mode`.
 4. Prepare changes in `prepare_code_review_workspace`.
-5. Submit the exact diff through `request_code_review`, show the returned
-   `review_markdown`, and stop for the user's next message.
+5. Submit the exact diff through `request_code_review`, including `workflow_id`.
+   Dependency changes are scanned from that exact workspace. Show the returned
+   `review_markdown` and stop for the user's next message.
 6. Resume with `record_code_review_decision`; apply an approval only through
    `apply_reviewed_patch`.
-7. Run `run_quality_gate` or individual workflow-bound Gradle tasks.
+7. Run `run_quality_gate`; it scans resolved dependencies, runs Detekt and
+   ktlint, then runs UAT Debug lint, unit tests, and assembly.
 8. Generate and run fail-closed Appium checks on the leased device.
 9. Use `collect_failure_bundle` when a gate fails.
 10. Run final workflow cleanup and verify that no temporary mock wiring remains.
@@ -86,6 +98,3 @@ Pending reviews can be recovered with `list_pending_code_reviews` and
 ```bash
 uv run python -m pytest -q
 ```
-
-CI and broader security/integration test expansion are intentionally not part of
-the current implementation scope.
